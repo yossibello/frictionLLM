@@ -116,7 +116,7 @@ os.makedirs("data", exist_ok=True)
 try:
     from datasets import load_dataset
     print("Loading WikiText-103 (~103M tokens)...")
-    ds = load_dataset("wikitext", "wikitext-103-raw-v1", trust_remote_code=True)
+    ds = load_dataset("wikitext", "wikitext-103-raw-v1")
     with open("data/input.txt", "w", encoding="utf-8") as f:
         for split in ["train", "validation", "test"]:
             for row in ds[split]:
