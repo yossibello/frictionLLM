@@ -99,10 +99,13 @@ device = (
     torch.device("mps")  if torch.backends.mps.is_available() else
     torch.device("cpu")
 )
+n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
 print(f"Device: {device}")
 if device.type == "cuda":
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
+    for i in range(n_gpus):
+        p = torch.cuda.get_device_properties(i)
+        print(f"  GPU {i}: {p.name}  {p.total_memory/1e9:.1f} GB")
+    print(f"Total GPUs: {n_gpus} — {'DataParallel enabled' if n_gpus > 1 else 'single GPU'}")
 """
 
 DATA_CELL = """\
@@ -156,14 +159,28 @@ print(f"Batches available: {len(train_ds):,}")
 TRAIN_FUNC_CELL = """\
 from friction_llm import FrictionConfig, FrictionLM, RLCFrictionLM, SharpnessCurriculum
 
+def unwrap(model):
+    \"\"\"Unwrap DataParallel to access base model methods.\"\"\"""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
 def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
                 lr=3e-4, log_every=50, label="model"):
     use_amp = device.type == "cuda"
     scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # Scale batch size across all GPUs
+    effective_batch = batch_size * max(n_gpus, 1)
+
+    # Wrap in DataParallel if multiple GPUs available
+    if n_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f"[{label}] DataParallel across {n_gpus} GPUs — effective batch {effective_batch}")
+
+    base = unwrap(model)   # always use base model for config / diagnostics
+
     # Separate physics params (no weight decay)
     physics, other = [], []
-    for n, p in model.named_parameters():
+    for n, p in base.named_parameters():
         if any(k in n for k in ("raw_mu","raw_ratio","log_L","log_R","log_C")):
             physics.append(p)
         else:
@@ -174,45 +191,45 @@ def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
         lr=lr, betas=(0.9, 0.95)
     )
 
-    curriculum = SharpnessCurriculum(model, model.config)
+    curriculum = SharpnessCurriculum(base, base.config)
     history = {"step": [], "loss": [], "val_loss": [], "sparsity": []}
-    best_val = float("inf")
     t0 = time.time()
 
     for step in range(max_steps + 1):
-        # LR warmup
         warmup = 200
         cur_lr = lr * min(step / warmup, 1.0)
         for pg in optimizer.param_groups:
             pg["lr"] = cur_lr
 
         model.train()
-        x, y = train_ds.get_batch(batch_size, device)
+        x, y = train_ds.get_batch(effective_batch, device)
         with torch.amp.autocast("cuda", enabled=use_amp):
             _, loss = model(x, y)
+        if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+            loss = loss.mean()   # DataParallel returns per-GPU losses
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(base.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
         curriculum.step()
 
         if step % log_every == 0:
-            # Validation
             model.eval()
             with torch.no_grad():
-                xv, yv = val_ds.get_batch(batch_size, device)
+                xv, yv = val_ds.get_batch(effective_batch, device)
                 _, vloss = model(xv, yv)
+                if isinstance(vloss, torch.Tensor) and vloss.dim() > 0:
+                    vloss = vloss.mean()
 
-            # Sparsity
             sample, _ = val_ds.get_batch(4, device)
-            if hasattr(model, "circuit_report"):
-                report  = model.circuit_report(sample)
+            if hasattr(base, "circuit_report"):
+                report   = base.circuit_report(sample)
                 sparsity = report["overall_sparsity"]
             else:
-                report  = model.measure_sparsity(sample)
+                report   = base.measure_sparsity(sample)
                 sparsity = report["overall"]
             model.train()
 
@@ -225,7 +242,8 @@ def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
                   f"| val {vloss.item():.4f} | sparsity {sparsity:.1%} "
                   f"| {dt*1000:.0f}ms/step")
 
-    return history
+    # Always return the unwrapped base model for diagnostics
+    return history, base
 """
 
 FRICTION_TRAIN_CELL = """\
@@ -234,8 +252,8 @@ cfg_f.max_seq_len = 256
 model_f = FrictionLM(cfg_f).to(device)
 print(f"FrictionLM: {model_f.param_count()/1e6:.1f}M params")
 
-history_f = train_model(model_f, train_ds, val_ds,
-                        max_steps=600, batch_size=16, label="FrictionLM")
+history_f, model_f = train_model(model_f, train_ds, val_ds,
+                                  max_steps=600, batch_size=16, label="FrictionLM")
 """
 
 RLC_TRAIN_CELL = """\
@@ -245,8 +263,8 @@ cfg_r.use_rlc = True
 model_r = RLCFrictionLM(cfg_r).to(device)
 print(f"RLCFrictionLM: {model_r.param_count()/1e6:.1f}M params")
 
-history_r = train_model(model_r, train_ds, val_ds,
-                        max_steps=600, batch_size=16, label="RLCFrictionLM")
+history_r, model_r = train_model(model_r, train_ds, val_ds,
+                                  max_steps=600, batch_size=16, label="RLCFrictionLM")
 """
 
 CIRCUIT_REPORT_CELL = """\
