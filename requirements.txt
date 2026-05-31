@@ -1,0 +1,10 @@
+torch>=2.0.0
+tiktoken
+numpy
+tqdm
+
+# Optional: HuggingFace datasets for training data
+datasets
+
+# Optional: Intel CPU acceleration (uncomment if using Intel CPU)
+# intel-extension-for-pytorch
