@@ -166,7 +166,7 @@ class TokenDataset:
                 self.data[i+1 : i+1+self.seq_len].astype(np.int64)) for i in ix])
         return x.to(device), y.to(device)
 
-SEQ_LEN  = 512
+SEQ_LEN  = 256
 train_ds = TokenDataset("data/train.bin", SEQ_LEN)
 val_ds   = TokenDataset("data/val.bin",   SEQ_LEN)
 print(f"Seq len : {SEQ_LEN}")
@@ -335,7 +335,7 @@ print("Watch: ω₀ spread (frequency divergence) + underdamped layers (resonanc
 history, model = train_rlc(
     model, train_ds, val_ds,
     max_steps=10000,
-    batch_size=16,
+    batch_size=8,      # 8 per GPU × 2 GPUs = 16 effective (fits in T4 16 GB)
     lr=3e-4,
     log_every=100,
     ckpt_every=1000,
