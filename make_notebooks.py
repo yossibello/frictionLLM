@@ -109,16 +109,29 @@ if device.type == "cuda":
 """
 
 DATA_CELL = """\
-import urllib.request, os
-
+import os
 os.makedirs("data", exist_ok=True)
-url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-if not os.path.exists("data/input.txt"):
+
+# WikiText-103: 103M tokens — right-sized for a 33M param model.
+# Falls back to TinyShakespeare if datasets not available.
+try:
+    from datasets import load_dataset
+    print("Loading WikiText-103 (~103M tokens)...")
+    ds = load_dataset("wikitext", "wikitext-103-raw-v1", trust_remote_code=True)
+    # Concatenate all splits into one text file
+    with open("data/input.txt", "w", encoding="utf-8") as f:
+        for split in ["train", "validation", "test"]:
+            for row in ds[split]:
+                text = row["text"].strip()
+                if text:
+                    f.write(text + "\\n")
+    print(f"WikiText-103 saved: {os.path.getsize('data/input.txt')/1e6:.0f} MB")
+except Exception as e:
+    print(f"datasets not available ({e}), falling back to TinyShakespeare")
+    import urllib.request
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
     urllib.request.urlretrieve(url, "data/input.txt")
-    print("Downloaded TinyShakespeare")
-else:
-    print("Data already downloaded")
-print(f"Size: {os.path.getsize('data/input.txt'):,} bytes")
+    print(f"TinyShakespeare: {os.path.getsize('data/input.txt')/1e6:.1f} MB — consider upgrading to WikiText-103")
 """
 
 TOKENIZE_CELL = """\
@@ -253,7 +266,7 @@ model_f = FrictionLM(cfg_f).to(device)
 print(f"FrictionLM: {model_f.param_count()/1e6:.1f}M params")
 
 history_f, model_f = train_model(model_f, train_ds, val_ds,
-                                  max_steps=1000, batch_size=16, label="FrictionLM")
+                                  max_steps=5000, batch_size=16, label="FrictionLM")
 """
 
 RLC_TRAIN_CELL = """\
@@ -269,7 +282,7 @@ print(f"RLCFrictionLM: {model_r.param_count()/1e6:.1f}M params")
 print(f"μ_s={cfg_r.mu_s_init}  dt={cfg_r.rlc_dt}  (tuned for charge scale)")
 
 history_r, model_r = train_model(model_r, train_ds, val_ds,
-                                  max_steps=1000, batch_size=16, label="RLCFrictionLM")
+                                  max_steps=5000, batch_size=16, label="RLCFrictionLM")
 """
 
 CIRCUIT_REPORT_CELL = """\
