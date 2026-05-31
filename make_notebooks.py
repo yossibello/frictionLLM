@@ -26,12 +26,6 @@ def code(src):
         "source": src,
     }
 
-def writefile_cell(path, filepath):
-    """Cell that writes a source file using %%writefile magic."""
-    with open(path, "r") as f:
-        body = f.read()
-    return code(f"%%writefile {filepath}\n" + body)
-
 def notebook(cells, accelerator="GPU"):
     meta = {
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
@@ -48,46 +42,24 @@ def write_nb(nb, path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Source files to bundle
+# Cell content
 # ─────────────────────────────────────────────────────────────────────────────
 
-SOURCE_FILES = [
-    ("friction_llm/config.py",       "friction_llm/config.py"),
-    ("friction_llm/friction_gate.py","friction_llm/friction_gate.py"),
-    ("friction_llm/attention.py",    "friction_llm/attention.py"),
-    ("friction_llm/block.py",        "friction_llm/block.py"),
-    ("friction_llm/model.py",        "friction_llm/model.py"),
-    ("friction_llm/curriculum.py",   "friction_llm/curriculum.py"),
-    ("friction_llm/rlc_neuron.py",   "friction_llm/rlc_neuron.py"),
-    ("friction_llm/rlc_block.py",    "friction_llm/rlc_block.py"),
-    ("friction_llm/rlc_model.py",    "friction_llm/rlc_model.py"),
-    ("friction_llm/__init__.py",     "friction_llm/__init__.py"),
-]
+TITLE_MD = """\
+# RLCFrictionLM — Deep Training Run
+### Full L+R+C circuit neurons: watching physics emerge across layers
 
+Each neuron is a damped harmonic oscillator with **learned** inductance (L),
+resistance (R), and capacitance (C). Starting from identical critical damping,
+the network freely discovers which layers should resonate and which should stabilise.
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared cell blocks
-# ─────────────────────────────────────────────────────────────────────────────
-
-TITLE_MD = """# FrictionLLM + RLCFrictionLM
-### A neural architecture based on physical friction and RLC circuit mechanics
-
-**Core idea:**
-Current LLMs are pure resistors — every weight fires for every token.
-This architecture maps real physics onto neurons:
-
-| Physics | Component | Effect in the network |
-|---|---|---|
-| Static friction  | μ_s threshold  | Neuron stays **stuck at 0** unless signal exceeds threshold |
-| Kinetic friction | μ_k drag       | Once fired, output = z − sign(z)·μ_k  (energy loss) |
-| Inductance (L)   | Inertia        | Resists rapid changes in activation |
-| Capacitance (C)  | Charge storage | Accumulates signal across **layers** before firing |
-| Resonance        | ω₀ = 1/√(LC)  | Each neuron tunes to a natural frequency |
-
-**What emerges:** sparsity (CPU-friendly inference), hierarchical feature tuning, and physically-principled dynamics.
+**What to watch during training:**
+- `ω₀ spread` — natural frequencies diverging across layers (starts at 0, grows)
+- `underdamped layers` — how many layers went resonant (ζ < 1)
+- `sparsity` — fraction of neurons silent (target: 70%+ for CPU advantage)
 """
 
-SETUP_COMMON = """\
+SETUP_CELL = """\
 import os, math, time, json
 import numpy as np
 import torch
@@ -100,53 +72,81 @@ device = (
     torch.device("cpu")
 )
 n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
-print(f"Device: {device}")
+print(f"Device : {device}")
 if device.type == "cuda":
     for i in range(n_gpus):
         p = torch.cuda.get_device_properties(i)
         print(f"  GPU {i}: {p.name}  {p.total_memory/1e9:.1f} GB")
-    print(f"Total GPUs: {n_gpus} — {'DataParallel enabled' if n_gpus > 1 else 'single GPU'}")
+    print(f"GPUs   : {n_gpus}  ({'DataParallel' if n_gpus > 1 else 'single GPU'})")
+"""
+
+CLONE_CELL = """\
+!pip install tiktoken datasets --quiet
+
+import os, subprocess, sys
+
+if not os.path.exists("frictionLLM"):
+    subprocess.run(["git", "clone",
+                    "https://github.com/yossibello/frictionLLM.git"], check=True)
+    print("Cloned frictionLLM")
+else:
+    subprocess.run(["git", "-C", "frictionLLM", "pull"], check=True)
+    print("Updated frictionLLM")
+
+sys.path.insert(0, "frictionLLM")
+os.chdir("frictionLLM")
+print("Working dir:", os.getcwd())
+"""
+
+IMPORT_CELL = """\
+from friction_llm import (
+    FrictionConfig, RLCFrictionLM, SharpnessCurriculum, RLCNeuron
+)
+cfg_test = FrictionConfig.tiny()
+cfg_test.use_rlc = True
+m = RLCFrictionLM(cfg_test)
+print(f"Import OK — tiny test model: {m.param_count()/1e6:.1f}M params")
+del m, cfg_test
 """
 
 DATA_CELL = """\
 import os
 os.makedirs("data", exist_ok=True)
 
-# WikiText-103: 103M tokens — right-sized for a 33M param model.
-# Falls back to TinyShakespeare if datasets not available.
 try:
     from datasets import load_dataset
     print("Loading WikiText-103 (~103M tokens)...")
     ds = load_dataset("wikitext", "wikitext-103-raw-v1", trust_remote_code=True)
-    # Concatenate all splits into one text file
     with open("data/input.txt", "w", encoding="utf-8") as f:
         for split in ["train", "validation", "test"]:
             for row in ds[split]:
                 text = row["text"].strip()
                 if text:
                     f.write(text + "\\n")
-    print(f"WikiText-103 saved: {os.path.getsize('data/input.txt')/1e6:.0f} MB")
+    print(f"Saved: {os.path.getsize('data/input.txt')/1e6:.0f} MB")
 except Exception as e:
-    print(f"datasets not available ({e}), falling back to TinyShakespeare")
     import urllib.request
-    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-    urllib.request.urlretrieve(url, "data/input.txt")
-    print(f"TinyShakespeare: {os.path.getsize('data/input.txt')/1e6:.1f} MB — consider upgrading to WikiText-103")
+    print(f"Falling back to TinyShakespeare ({e})")
+    urllib.request.urlretrieve(
+        "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
+        "data/input.txt"
+    )
+    print(f"Downloaded: {os.path.getsize('data/input.txt')/1e6:.1f} MB")
 """
 
 TOKENIZE_CELL = """\
-import tiktoken
-import numpy as np
+import tiktoken, numpy as np
 
 enc = tiktoken.get_encoding("gpt2")
-with open("data/input.txt") as f:
+with open("data/input.txt", encoding="utf-8") as f:
     text = f.read()
 
 tokens = np.array(enc.encode_ordinary(text), dtype=np.uint16)
 split  = int(0.9 * len(tokens))
 tokens[:split].tofile("data/train.bin")
 tokens[split:].tofile("data/val.bin")
-print(f"Train: {split:,} tokens   Val: {len(tokens)-split:,} tokens")
+print(f"Train : {split:,} tokens")
+print(f"Val   : {len(tokens)-split:,} tokens")
 """
 
 DATALOADER_CELL = """\
@@ -159,45 +159,64 @@ class TokenDataset:
         return max(0, len(self.data) - self.seq_len - 1)
 
     def get_batch(self, batch_size, device):
-        ix = torch.randint(len(self.data) - self.seq_len - 1, (batch_size,))
-        x  = torch.stack([torch.from_numpy(self.data[i:i+self.seq_len].astype(np.int64)) for i in ix])
-        y  = torch.stack([torch.from_numpy(self.data[i+1:i+1+self.seq_len].astype(np.int64)) for i in ix])
+        ix = torch.randint(len(self), (batch_size,))
+        x  = torch.stack([torch.from_numpy(
+                self.data[i : i+self.seq_len].astype(np.int64)) for i in ix])
+        y  = torch.stack([torch.from_numpy(
+                self.data[i+1 : i+1+self.seq_len].astype(np.int64)) for i in ix])
         return x.to(device), y.to(device)
 
-train_ds = TokenDataset("data/train.bin", seq_len=256)
-val_ds   = TokenDataset("data/val.bin",   seq_len=256)
-print(f"Batches available: {len(train_ds):,}")
+SEQ_LEN  = 512
+train_ds = TokenDataset("data/train.bin", SEQ_LEN)
+val_ds   = TokenDataset("data/val.bin",   SEQ_LEN)
+print(f"Seq len : {SEQ_LEN}")
+print(f"Train   : {len(train_ds):,} positions")
+print(f"Val     : {len(val_ds):,} positions")
 """
 
 TRAIN_FUNC_CELL = """\
-from friction_llm import FrictionConfig, FrictionLM, RLCFrictionLM, SharpnessCurriculum
+from friction_llm import FrictionConfig, RLCFrictionLM, SharpnessCurriculum
 
 def unwrap(model):
-    \"\"\"Unwrap DataParallel to access base model methods.\"\"\"""
     return model.module if isinstance(model, nn.DataParallel) else model
 
-def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
-                lr=3e-4, log_every=50, label="model"):
+def circuit_snapshot(base):
+    \"\"\"Per-layer ω₀, ζ, underdamped %, sparsity — for live monitoring.\"\"\"
+    rows = []
+    for block in base.blocks:
+        rlc  = block.rlc_block.rlc
+        fric = block.rlc_block.friction
+        rows.append({
+            "omega_0": rlc.omega_0.mean().item(),
+            "zeta":    rlc.damping_ratio.mean().item(),
+            "underdamped_pct": (rlc.damping_ratio < 1.0).float().mean().item() * 100,
+            "mu_s":    fric.mu_s.mean().item(),
+        })
+    return rows
+
+def train_rlc(model, train_ds, val_ds,
+              max_steps=10000, batch_size=16,
+              lr=3e-4, log_every=100,
+              ckpt_every=1000, ckpt_dir="checkpoints"):
+
+    os.makedirs(ckpt_dir, exist_ok=True)
     use_amp = device.type == "cuda"
     scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # Scale batch size across all GPUs
     effective_batch = batch_size * max(n_gpus, 1)
-
-    # Wrap in DataParallel if multiple GPUs available
     if n_gpus > 1:
         model = nn.DataParallel(model)
-        print(f"[{label}] DataParallel across {n_gpus} GPUs — effective batch {effective_batch}")
+        print(f"DataParallel: {n_gpus} GPUs  effective batch={effective_batch}")
 
-    base = unwrap(model)   # always use base model for config / diagnostics
+    base = unwrap(model)
 
-    # Separate physics params (no weight decay)
     physics, other = [], []
     for n, p in base.named_parameters():
         if any(k in n for k in ("raw_mu","raw_ratio","log_L","log_R","log_C")):
             physics.append(p)
         else:
             other.append(p)
+
     optimizer = torch.optim.AdamW(
         [{"params": other,   "weight_decay": 0.1},
          {"params": physics, "weight_decay": 0.0}],
@@ -205,15 +224,21 @@ def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
     )
 
     curriculum = SharpnessCurriculum(base, base.config)
-    history = {"step": [], "loss": [], "val_loss": [], "sparsity": []}
-    t0 = time.time()
 
+    history = {
+        "step": [], "loss": [], "val_loss": [], "sparsity": [],
+        "omega_spread": [], "zeta_spread": [],
+        "underdamped_layers": [], "sharpness": [],
+        "layers": [],   # full per-layer snapshot at each log step
+    }
     lr_min = lr / 10
+    t0     = time.time()
+
     for step in range(max_steps + 1):
-        # Linear warmup then cosine decay
+        # Cosine LR with warmup
         warmup = min(500, max_steps // 10)
         if step < warmup:
-            cur_lr = lr * step / warmup
+            cur_lr = lr * step / max(warmup, 1)
         else:
             progress = (step - warmup) / (max_steps - warmup)
             cur_lr = lr_min + 0.5 * (lr - lr_min) * (1 + math.cos(math.pi * progress))
@@ -224,8 +249,8 @@ def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
         x, y = train_ds.get_batch(effective_batch, device)
         with torch.amp.autocast("cuda", enabled=use_amp):
             _, loss = model(x, y)
-        if isinstance(loss, torch.Tensor) and loss.dim() > 0:
-            loss = loss.mean()   # DataParallel returns per-GPU losses
+        if loss.dim() > 0:
+            loss = loss.mean()
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -233,184 +258,218 @@ def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
-        curriculum.step()
+        sharpness = curriculum.step()
 
+        # ── Log ──────────────────────────────────────────────────────────────
         if step % log_every == 0:
             model.eval()
             with torch.no_grad():
                 xv, yv = val_ds.get_batch(effective_batch, device)
                 _, vloss = model(xv, yv)
-                if isinstance(vloss, torch.Tensor) and vloss.dim() > 0:
+                if vloss.dim() > 0:
                     vloss = vloss.mean()
 
+            # Sparsity + circuit snapshot (use base model directly, no DataParallel)
             sample, _ = val_ds.get_batch(4, device)
-            if hasattr(base, "circuit_report"):
-                report   = base.circuit_report(sample)
-                sparsity = report["overall_sparsity"]
-            else:
-                report   = base.measure_sparsity(sample)
-                sparsity = report["overall"]
+            report  = base.circuit_report(sample)
+            sparsity = report["overall_sparsity"]
+            snap    = circuit_snapshot(base)
             model.train()
+
+            omegas = [r["omega_0"] for r in snap]
+            zetas  = [r["zeta"]    for r in snap]
+            omega_spread = max(omegas) - min(omegas)
+            zeta_spread  = max(zetas)  - min(zetas)
+            underdamped  = sum(1 for z in zetas if z < 1.0)
 
             dt = (time.time() - t0) / max(step, 1)
             history["step"].append(step)
             history["loss"].append(loss.item())
             history["val_loss"].append(vloss.item())
             history["sparsity"].append(sparsity)
-            print(f"[{label}] step {step:4d} | loss {loss.item():.4f} "
-                  f"| val {vloss.item():.4f} | sparsity {sparsity:.1%} "
-                  f"| {dt*1000:.0f}ms/step")
+            history["omega_spread"].append(omega_spread)
+            history["zeta_spread"].append(zeta_spread)
+            history["underdamped_layers"].append(underdamped)
+            history["sharpness"].append(sharpness)
+            history["layers"].append(snap)
 
-    # Always return the unwrapped base model for diagnostics
+            print(
+                f"step {step:5d} | loss {loss.item():.4f} | val {vloss.item():.4f} "
+                f"| sparse {sparsity:.1%} | ω₀spread {omega_spread:.4f} "
+                f"| underdamped {underdamped}/{len(snap)} "
+                f"| sharp {sharpness:.1f} | {dt*1000:.0f}ms/step"
+            )
+
+        # ── Checkpoint ───────────────────────────────────────────────────────
+        if step % ckpt_every == 0 and step > 0:
+            path = f"{ckpt_dir}/rlc_step_{step:06d}.pt"
+            torch.save({
+                "model":      base.state_dict(),
+                "optimizer":  optimizer.state_dict(),
+                "curriculum": curriculum.state_dict(),
+                "step":       step,
+                "history":    history,
+                "config":     base.config,
+            }, path)
+            print(f"  → saved {path}")
+
     return history, base
 """
 
-FRICTION_TRAIN_CELL = """\
-cfg_f = FrictionConfig.small()
-cfg_f.max_seq_len = 256
-model_f = FrictionLM(cfg_f).to(device)
-print(f"FrictionLM: {model_f.param_count()/1e6:.1f}M params")
-
-history_f, model_f = train_model(model_f, train_ds, val_ds,
-                                  max_steps=5000, batch_size=16, label="FrictionLM")
-"""
-
 RLC_TRAIN_CELL = """\
-cfg_r = FrictionConfig.small()
-cfg_r.max_seq_len = 256
-cfg_r.use_rlc     = True
-# RLC charge q ≈ dt²×V ≈ 0.01×V — much smaller than raw gate signal.
-# Lower μ_s so charge can actually break through the threshold.
-cfg_r.mu_s_init   = 0.05   # was 0.5 — charge lives in 0.01–0.1 range
-cfg_r.rlc_dt      = 0.3    # larger step → more charge per layer (was 0.1)
-model_r = RLCFrictionLM(cfg_r).to(device)
-print(f"RLCFrictionLM: {model_r.param_count()/1e6:.1f}M params")
-print(f"μ_s={cfg_r.mu_s_init}  dt={cfg_r.rlc_dt}  (tuned for charge scale)")
+# Medium config: 117M params, 12 layers — right size for WikiText-103
+cfg = FrictionConfig.medium()
+cfg.max_seq_len = SEQ_LEN
+cfg.use_rlc     = True
+cfg.mu_s_init   = 0.05   # charge scale is ~dt²×V, much smaller than raw signal
+cfg.rlc_dt      = 0.3    # larger step → more charge per layer
 
-history_r, model_r = train_model(model_r, train_ds, val_ds,
-                                  max_steps=5000, batch_size=16, label="RLCFrictionLM")
+model = RLCFrictionLM(cfg).to(device)
+print(f"RLCFrictionLM: {model.param_count()/1e6:.1f}M params")
+print(f"Layers: {cfg.n_layers}  d_model: {cfg.d_model}  d_ff: {cfg.d_ff}")
+print(f"μ_s={cfg.mu_s_init}  rlc_dt={cfg.rlc_dt}")
+print()
+print("Training for 10 000 steps — circuit physics will emerge after ~2 000")
+print("Watch: ω₀ spread (frequency divergence) + underdamped layers (resonance)")
+
+history, model = train_rlc(
+    model, train_ds, val_ds,
+    max_steps=10000,
+    batch_size=16,
+    lr=3e-4,
+    log_every=100,
+    ckpt_every=1000,
+)
 """
 
 CIRCUIT_REPORT_CELL = """\
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
-sample_text = "To be or not to be, that is the question"
-sample_ids  = torch.tensor(enc.encode_ordinary(sample_text),
-                           dtype=torch.long, device=device).unsqueeze(0)
 
-model_r.eval()
-model_r.print_circuit_report(sample_ids)
+sample_ids = torch.tensor(
+    enc.encode_ordinary("The relationship between"),
+    dtype=torch.long, device=device
+).unsqueeze(0)
+
+model.eval()
+model.print_circuit_report(sample_ids)
 """
 
-PLOT_CELL = """\
+PHYSICS_PLOT_CELL = """\
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-fig = plt.figure(figsize=(16, 10))
-fig.suptitle("FrictionLLM vs RLCFrictionLM — Training Dynamics", fontsize=14, fontweight="bold")
-gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+steps = history["step"]
+n_layers = len(history["layers"][0]) if history["layers"] else 0
 
-# ── Loss curves ───────────────────────────────────────────────────────────────
-ax1 = fig.add_subplot(gs[0, :2])
-ax1.plot(history_f["step"], history_f["val_loss"],  label="FrictionLM val",  color="#e05a5a", linewidth=2)
-ax1.plot(history_r["step"], history_r["val_loss"],  label="RLCFrictionLM val", color="#5a9ce0", linewidth=2)
-ax1.plot(history_f["step"], history_f["loss"],  linestyle="--", alpha=0.4, color="#e05a5a")
-ax1.plot(history_r["step"], history_r["loss"],  linestyle="--", alpha=0.4, color="#5a9ce0")
-ax1.set_xlabel("Step"); ax1.set_ylabel("Cross-Entropy Loss")
-ax1.set_title("Training & Validation Loss"); ax1.legend(); ax1.grid(alpha=0.3)
+fig = plt.figure(figsize=(18, 12))
+fig.suptitle("RLCFrictionLM — Circuit Physics Emerging During Training",
+             fontsize=14, fontweight="bold")
+gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35)
 
-# ── Sparsity ──────────────────────────────────────────────────────────────────
+# ── Loss ─────────────────────────────────────────────────────────────────────
+ax = fig.add_subplot(gs[0, :2])
+ax.plot(steps, history["loss"],     label="train", alpha=0.7, linewidth=1.5)
+ax.plot(steps, history["val_loss"], label="val",   linewidth=2)
+ax.set(xlabel="Step", ylabel="Loss", title="Training & Validation Loss")
+ax.legend(); ax.grid(alpha=0.3)
+
+# ── Sparsity ─────────────────────────────────────────────────────────────────
 ax2 = fig.add_subplot(gs[0, 2])
-ax2.plot(history_f["step"], [s*100 for s in history_f["sparsity"]], color="#e05a5a", linewidth=2, label="FrictionLM")
-ax2.plot(history_r["step"], [s*100 for s in history_r["sparsity"]], color="#5a9ce0", linewidth=2, label="RLCFrictionLM")
-ax2.axhline(70, linestyle="--", color="gray", alpha=0.5, label="CPU-efficient threshold")
-ax2.set_xlabel("Step"); ax2.set_ylabel("Sparsity (%)")
-ax2.set_title("Gate Sparsity (higher = more neurons silent)"); ax2.legend(); ax2.grid(alpha=0.3)
+ax2.plot(steps, [s*100 for s in history["sparsity"]], color="steelblue", linewidth=2)
+ax2.axhline(70, linestyle="--", color="gray", alpha=0.5, label="CPU target (70%)")
+ax2.set(xlabel="Step", ylabel="Sparsity %", title="Gate Sparsity Over Training")
+ax2.legend(); ax2.grid(alpha=0.3)
 
-# ── RLC natural frequencies per layer ────────────────────────────────────────
-ax3 = fig.add_subplot(gs[1, 0])
-model_r.eval()
-omega_per_layer, zeta_per_layer = [], []
-for i, block in enumerate(model_r.blocks):
-    rlc = block.rlc_block.rlc
-    omega_per_layer.append(rlc.omega_0.detach().cpu().numpy())
-    zeta_per_layer.append(rlc.damping_ratio.detach().cpu().numpy())
+# ── ω₀ spread (key metric: are layers finding different frequencies?) ─────────
+ax3 = fig.add_subplot(gs[1, :2])
+ax3.plot(steps, history["omega_spread"], color="darkorange", linewidth=2)
+ax3.set(xlabel="Step", ylabel="max(ω₀) − min(ω₀)",
+        title="ω₀ Spread Across Layers  (0 = all same,  > 0 = differentiated)")
+ax3.grid(alpha=0.3)
 
-colors = plt.cm.viridis([i / len(omega_per_layer) for i in range(len(omega_per_layer))])
-for i, (w, c) in enumerate(zip(omega_per_layer, colors)):
-    ax3.hist(w, bins=30, alpha=0.6, color=c, label=f"Layer {i}")
-ax3.set_xlabel("Natural Frequency ω₀"); ax3.set_ylabel("Count")
-ax3.set_title("ω₀ Distribution per Layer\\n(divergence = different frequency bands)"); ax3.legend(fontsize=8); ax3.grid(alpha=0.3)
+# ── Underdamped layer count ───────────────────────────────────────────────────
+ax4 = fig.add_subplot(gs[1, 2])
+ax4.plot(steps, history["underdamped_layers"], color="crimson", linewidth=2,
+         drawstyle="steps-post")
+ax4.set(xlabel="Step", ylabel="Layers with ζ < 1",
+        title=f"Resonant Layers  (out of {n_layers})")
+ax4.set_yticks(range(n_layers + 1)); ax4.grid(alpha=0.3)
 
-# ── Damping ratio per layer ───────────────────────────────────────────────────
-ax4 = fig.add_subplot(gs[1, 1])
-for i, (z, c) in enumerate(zip(zeta_per_layer, colors)):
-    ax4.hist(z, bins=30, alpha=0.6, color=c, label=f"Layer {i}")
-ax4.axvline(1.0, color="red", linestyle="--", linewidth=2, label="Critical damping (ζ=1)")
-ax4.set_xlabel("Damping Ratio ζ"); ax4.set_ylabel("Count")
-ax4.set_title("Damping Ratio per Layer\\n(<1=resonant, 1=critical, >1=overdamped)"); ax4.legend(fontsize=8); ax4.grid(alpha=0.3)
+# ── Per-layer ω₀ evolution (heatmap over training) ───────────────────────────
+ax5 = fig.add_subplot(gs[2, :2])
+if history["layers"] and n_layers > 0:
+    omega_matrix = np.array([[r["omega_0"] for r in snap]
+                              for snap in history["layers"]]).T   # [n_layers, steps]
+    im = ax5.imshow(omega_matrix, aspect="auto", cmap="RdYlGn",
+                    extent=[steps[0], steps[-1], n_layers-0.5, -0.5])
+    plt.colorbar(im, ax=ax5, label="ω₀")
+    ax5.set(xlabel="Step", ylabel="Layer", yticks=range(n_layers),
+            yticklabels=[f"L{i}" for i in range(n_layers)],
+            title="ω₀ per Layer Over Training  (green=higher freq, red=lower freq)")
 
-# ── μ_s per layer (friction thresholds) ──────────────────────────────────────
-ax5 = fig.add_subplot(gs[1, 2])
-mu_s_per_layer = []
-for block in model_r.blocks:
-    mu_s_per_layer.append(block.rlc_block.friction.mu_s.detach().cpu().numpy())
-ax5.boxplot(mu_s_per_layer, labels=[f"L{i}" for i in range(len(mu_s_per_layer))])
-ax5.set_xlabel("Layer"); ax5.set_ylabel("μ_s value")
-ax5.set_title("Static Friction Thresholds μ_s\\n(higher = harder to activate)"); ax5.grid(alpha=0.3)
+# ── Per-layer ζ at end of training ───────────────────────────────────────────
+ax6 = fig.add_subplot(gs[2, 2])
+if history["layers"]:
+    final_zeta = [r["zeta"] for r in history["layers"][-1]]
+    colors = ["crimson" if z < 1.0 else "steelblue" for z in final_zeta]
+    ax6.barh(range(n_layers), final_zeta, color=colors)
+    ax6.axvline(1.0, color="black", linestyle="--", linewidth=1.5, label="ζ=1 (critical)")
+    ax6.set(xlabel="Damping ratio ζ", yticks=range(n_layers),
+            yticklabels=[f"L{i}" for i in range(n_layers)],
+            title="Final ζ per Layer\n(red=resonant, blue=overdamped)")
+    ax6.legend(fontsize=8); ax6.grid(alpha=0.3, axis="x")
 
-plt.savefig("friction_rlc_analysis.png", dpi=150, bbox_inches="tight")
+plt.savefig("rlc_physics.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Plot saved to friction_rlc_analysis.png")
+print("Saved: rlc_physics.png")
+"""
+
+SPARSITY_CELL = """\
+sample, _ = val_ds.get_batch(8, device)
+model.eval()
+model.print_circuit_report(sample)
 """
 
 GENERATE_CELL = """\
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
 
-def generate(model, prompt, max_tokens=150, temperature=0.8, top_k=40):
-    model.eval()
+prompts = [
+    "The theory of",
+    "In the year 1900",
+    "Scientists discovered that",
+]
+
+for prompt in prompts:
     ids = enc.encode_ordinary(prompt)
     idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-    out = model.generate(idx, max_new_tokens=max_tokens,
-                         temperature=temperature, top_k=top_k)
-    return enc.decode(out[0].tolist())
-
-prompt = "HAMLET:\\nTo be or not to be"
-
-print("=" * 60)
-print("FrictionLM output:")
-print("=" * 60)
-print(generate(model_f, prompt))
-
-print()
-print("=" * 60)
-print("RLCFrictionLM output:")
-print("=" * 60)
-print(generate(model_r, prompt))
+    out = model.generate(idx, max_new_tokens=120, temperature=0.8, top_k=40)
+    print(f"Prompt: {prompt!r}")
+    print(enc.decode(out[0].tolist()))
+    print("-" * 60)
 """
 
-SPARSITY_ANALYSIS_CELL = """\
-# Per-layer sparsity breakdown for both models
-model_f.eval(); model_r.eval()
-sample, _ = val_ds.get_batch(8, device)
+RESUME_MD = """\
+## Resuming from checkpoint
 
-print("FrictionLM — per-layer sparsity:")
-stats_f = model_f.measure_sparsity(sample)
-for k, v in stats_f.items():
-    if k == "overall":
-        print(f"  OVERALL: {v:.1%}")
-    else:
-        print(f"  {k}: {v['sparsity']:.1%}  μ_s={v['mu_s']:.3f}  μ_k={v['mu_k']:.3f}")
+If the Kaggle session restarted, resume from the last checkpoint:
 
-print()
-print("RLCFrictionLM — per-layer circuit stats:")
-model_r.print_circuit_report(sample)
+```python
+ckpt = torch.load("checkpoints/rlc_step_005000.pt", map_location=device)
+cfg  = ckpt["config"]
+model = RLCFrictionLM(cfg).to(device)
+model.load_state_dict(ckpt["model"])
+history = ckpt["history"]
+print(f"Resumed from step {ckpt['step']}, last loss {history['loss'][-1]:.4f}")
+```
+
+Then call `train_rlc(model, ...)` with `max_steps` set to whatever you want to continue to.
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build Kaggle notebook (fully self-contained)
+# Build Kaggle notebook — RLC deep training
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_kaggle():
@@ -418,148 +477,79 @@ def build_kaggle():
 
     cells.append(md(TITLE_MD))
 
-    cells.append(md("## 1 · Install dependencies & clone repo"))
-    cells.append(code(
-        "!pip install tiktoken --quiet\n"
-        "\n"
-        "import os, subprocess\n"
-        "if not os.path.exists('frictionLLM'):\n"
-        "    subprocess.run(['git', 'clone', 'https://github.com/yossibello/frictionLLM.git'], check=True)\n"
-        "    print('Cloned frictionLLM')\n"
-        "else:\n"
-        "    subprocess.run(['git', '-C', 'frictionLLM', 'pull'], check=True)\n"
-        "    print('Updated frictionLLM')\n"
-        "\n"
-        "import sys\n"
-        "sys.path.insert(0, 'frictionLLM')\n"
-        "os.chdir('frictionLLM')\n"
-        "print('Working dir:', os.getcwd())"
-    ))
+    cells.append(md("## 1 · Clone repo & install"))
+    cells.append(code(CLONE_CELL))
 
     cells.append(md("## 2 · GPU setup"))
-    cells.append(code(SETUP_COMMON))
+    cells.append(code(SETUP_CELL))
 
     cells.append(md("## 3 · Verify imports"))
-    cells.append(code(
-        "from friction_llm import (\n"
-        "    FrictionConfig, FrictionLM, RLCFrictionLM,\n"
-        "    SharpnessCurriculum, RLCNeuron\n"
-        ")\n"
-        "print('All imports OK')\n"
-        "cfg_test = FrictionConfig.tiny()\n"
-        "m_test = RLCFrictionLM(cfg_test)\n"
-        "print(f'Tiny RLC model: {m_test.param_count()/1e6:.1f}M params')"
-    ))
+    cells.append(code(IMPORT_CELL))
 
-    cells.append(md("## 4 · Download & tokenise data\n\nUsing TinyShakespeare (~1 MB) — swap in any .txt corpus."))
+    cells.append(md("## 4 · Data — WikiText-103"))
     cells.append(code(DATA_CELL))
     cells.append(code(TOKENIZE_CELL))
     cells.append(code(DATALOADER_CELL))
 
-    cells.append(md("## 5 · Training function"))
+    cells.append(md("## 5 · Training function\n\nLogs ω₀ spread and underdamped layer count every step — watch the physics emerge."))
     cells.append(code(TRAIN_FUNC_CELL))
 
     cells.append(md(
-        "## 6 · Train FrictionLM  (R only — static + kinetic friction)\n\n"
-        "The surrogate sharpness anneals from 3 → 50 over training.\n"
-        "Watch **sparsity** grow as the curriculum hardens the gate."
-    ))
-    cells.append(code(FRICTION_TRAIN_CELL))
-
-    cells.append(md(
-        "## 7 · Train RLCFrictionLM  (full L + R + C circuit)\n\n"
-        "Same architecture but the FFN is now a full RLC circuit neuron.\n"
-        "Each neuron has its own inductance L, resistance R, and capacitance C.\n"
-        "Charge accumulates across layers — the circuit fires when charge > μ_s."
+        "## 6 · Train — RLCFrictionLM (117M params, 10 000 steps)\n\n"
+        "Expected time on 2× T4: **~3 hours**.\n"
+        "Checkpoints saved every 1 000 steps → session can be resumed.\n\n"
+        "Key milestones to watch:\n"
+        "- **step ~500**: warmup ends, LR hits peak\n"
+        "- **step ~1000**: sharpness curriculum starts annealing\n"
+        "- **step ~2000**: ω₀ spread starts growing — layers finding different frequencies\n"
+        "- **step ~5000**: resonant vs overdamped pattern solidifies\n"
     ))
     cells.append(code(RLC_TRAIN_CELL))
 
-    cells.append(md("## 8 · Circuit physics report\n\nPer-layer ω₀ (natural frequency) and ζ (damping ratio) after training."))
+    cells.append(md("## 7 · Circuit physics report"))
     cells.append(code(CIRCUIT_REPORT_CELL))
 
-    cells.append(md("## 9 · Sparsity analysis"))
-    cells.append(code(SPARSITY_ANALYSIS_CELL))
+    cells.append(md("## 8 · Visualise circuit evolution"))
+    cells.append(code(PHYSICS_PLOT_CELL))
 
-    cells.append(md("## 10 · Visualisations"))
-    cells.append(code(PLOT_CELL))
+    cells.append(md("## 9 · Sparsity detail"))
+    cells.append(code(SPARSITY_CELL))
 
-    cells.append(md("## 11 · Text generation"))
+    cells.append(md("## 10 · Text generation"))
     cells.append(code(GENERATE_CELL))
 
-    cells.append(md(
-        "## What to try next\n\n"
-        "- **More steps**: `max_steps=20000` on an A6000 will get loss below 3.0\n"
-        "- **Friction attention**: set `config.use_friction_attention=True` to gate attention logits\n"
-        "- **Sparsity reg**: set `config.sparsity_reg=0.01` to push sparsity toward 80%+\n"
-        "- **Large corpus**: swap TinyShakespeare for WikiText-103 or OpenWebText\n"
-        "- **Ablation**: compare FrictionLM vs RLCFrictionLM at the same param count\n"
-    ))
+    cells.append(md(RESUME_MD))
 
     return notebook(cells, accelerator="GPU")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build JupyterHub notebook (assumes local repo, friction_llm installed)
+# Build JupyterHub notebook
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_jupyterhub():
     cells = []
-
     cells.append(md(TITLE_MD))
-
-    cells.append(md("## Setup\n\nRun from the repo root after `pip install torch tiktoken numpy tqdm`."))
-    cells.append(code(SETUP_COMMON))
-
-    cells.append(md("## Verify package"))
+    cells.append(md("## Setup\n\nRun from repo root. Requires: `torch tiktoken datasets`"))
     cells.append(code(
-        "import sys\n"
-        "sys.path.insert(0, '.')   # repo root\n"
-        "\n"
-        "from friction_llm import (\n"
-        "    FrictionConfig, FrictionLM, RLCFrictionLM,\n"
-        "    SharpnessCurriculum, RLCNeuron\n"
-        ")\n"
-        "print('friction_llm loaded OK')\n"
+        "import sys; sys.path.insert(0, '.')\n" + SETUP_CELL
     ))
-
-    cells.append(md("## Prepare data\n\nOnly needed once. Points at `data/input.txt`."))
+    cells.append(code(IMPORT_CELL))
+    cells.append(md("## Data"))
     cells.append(code(DATA_CELL))
     cells.append(code(TOKENIZE_CELL))
     cells.append(code(DATALOADER_CELL))
-
     cells.append(md("## Training"))
     cells.append(code(TRAIN_FUNC_CELL))
-
-    cells.append(md("### Train FrictionLM (R only)"))
-    cells.append(code(FRICTION_TRAIN_CELL))
-
-    cells.append(md("### Train RLCFrictionLM (full L + R + C)"))
+    cells.append(md("## Train RLCFrictionLM"))
     cells.append(code(RLC_TRAIN_CELL))
-
-    cells.append(md("## Circuit physics report"))
+    cells.append(md("## Circuit report"))
     cells.append(code(CIRCUIT_REPORT_CELL))
-
-    cells.append(md("## Sparsity analysis"))
-    cells.append(code(SPARSITY_ANALYSIS_CELL))
-
-    cells.append(md("## Visualisations"))
-    cells.append(code(PLOT_CELL))
-
-    cells.append(md("## Text generation"))
+    cells.append(md("## Visualise"))
+    cells.append(code(PHYSICS_PLOT_CELL))
+    cells.append(md("## Generate"))
     cells.append(code(GENERATE_CELL))
-
-    cells.append(md(
-        "## Physics concepts demonstrated\n\n"
-        "| Concept | Where it shows up | How to observe |\n"
-        "|---|---|---|\n"
-        "| Static friction | Sparsity % | Most neurons stay at 0 |\n"
-        "| Kinetic drag | Output amplitude | Active neurons lose μ_k energy |\n"
-        "| Jolt | μ_s − μ_k gap | Neurons jump, don't ramp |\n"
-        "| Capacitance | Charge accumulation | q builds across layers |\n"
-        "| Resonance | ω₀ divergence | Layers evolve different frequencies |\n"
-        "| Damping modes | ζ histogram | Some neurons go underdamped (resonant) |\n"
-    ))
-
+    cells.append(md(RESUME_MD))
     return notebook(cells, accelerator=None)
 
 
@@ -567,11 +557,9 @@ def build_jupyterhub():
 
 if __name__ == "__main__":
     os.makedirs(os.path.join(ROOT, "notebooks"), exist_ok=True)
-
-    kaggle_path = os.path.join(ROOT, "notebooks", "friction_llm_kaggle.ipynb")
-    jupyterhub_path = os.path.join(ROOT, "notebooks", "friction_llm_jupyterhub.ipynb")
-
     print("Building notebooks...")
-    write_nb(build_kaggle(),     kaggle_path)
-    write_nb(build_jupyterhub(), jupyterhub_path)
+    write_nb(build_kaggle(),
+             os.path.join(ROOT, "notebooks", "friction_llm_kaggle.ipynb"))
+    write_nb(build_jupyterhub(),
+             os.path.join(ROOT, "notebooks", "friction_llm_jupyterhub.ipynb"))
     print("Done.")
