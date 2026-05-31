@@ -373,19 +373,28 @@ def build_kaggle():
 
     cells.append(md(TITLE_MD))
 
-    cells.append(md("## 1 · Install dependencies"))
-    cells.append(code("!pip install torch tiktoken numpy tqdm --quiet"))
+    cells.append(md("## 1 · Install dependencies & clone repo"))
+    cells.append(code(
+        "!pip install tiktoken --quiet\n"
+        "\n"
+        "import os, subprocess\n"
+        "if not os.path.exists('frictionLLM'):\n"
+        "    subprocess.run(['git', 'clone', 'https://github.com/yossibello/frictionLLM.git'], check=True)\n"
+        "    print('Cloned frictionLLM')\n"
+        "else:\n"
+        "    subprocess.run(['git', '-C', 'frictionLLM', 'pull'], check=True)\n"
+        "    print('Updated frictionLLM')\n"
+        "\n"
+        "import sys\n"
+        "sys.path.insert(0, 'frictionLLM')\n"
+        "os.chdir('frictionLLM')\n"
+        "print('Working dir:', os.getcwd())"
+    ))
 
     cells.append(md("## 2 · GPU setup"))
     cells.append(code(SETUP_COMMON))
 
-    cells.append(md("## 3 · Write model source files"))
-    cells.append(code("import os\nos.makedirs('friction_llm', exist_ok=True)"))
-    for src_path, dest_path in SOURCE_FILES:
-        full = os.path.join(ROOT, src_path)
-        cells.append(writefile_cell(full, dest_path))
-
-    cells.append(md("## 4 · Verify imports"))
+    cells.append(md("## 3 · Verify imports"))
     cells.append(code(
         "from friction_llm import (\n"
         "    FrictionConfig, FrictionLM, RLCFrictionLM,\n"
@@ -397,39 +406,39 @@ def build_kaggle():
         "print(f'Tiny RLC model: {m_test.param_count()/1e6:.1f}M params')"
     ))
 
-    cells.append(md("## 5 · Download & tokenise data\n\nUsing TinyShakespeare (~1 MB) — swap in any .txt corpus."))
+    cells.append(md("## 4 · Download & tokenise data\n\nUsing TinyShakespeare (~1 MB) — swap in any .txt corpus."))
     cells.append(code(DATA_CELL))
     cells.append(code(TOKENIZE_CELL))
     cells.append(code(DATALOADER_CELL))
 
-    cells.append(md("## 6 · Training function"))
+    cells.append(md("## 5 · Training function"))
     cells.append(code(TRAIN_FUNC_CELL))
 
     cells.append(md(
-        "## 7 · Train FrictionLM  (R only — static + kinetic friction)\n\n"
+        "## 6 · Train FrictionLM  (R only — static + kinetic friction)\n\n"
         "The surrogate sharpness anneals from 3 → 50 over training.\n"
         "Watch **sparsity** grow as the curriculum hardens the gate."
     ))
     cells.append(code(FRICTION_TRAIN_CELL))
 
     cells.append(md(
-        "## 8 · Train RLCFrictionLM  (full L + R + C circuit)\n\n"
+        "## 7 · Train RLCFrictionLM  (full L + R + C circuit)\n\n"
         "Same architecture but the FFN is now a full RLC circuit neuron.\n"
         "Each neuron has its own inductance L, resistance R, and capacitance C.\n"
         "Charge accumulates across layers — the circuit fires when charge > μ_s."
     ))
     cells.append(code(RLC_TRAIN_CELL))
 
-    cells.append(md("## 9 · Circuit physics report\n\nPer-layer ω₀ (natural frequency) and ζ (damping ratio) after training."))
+    cells.append(md("## 8 · Circuit physics report\n\nPer-layer ω₀ (natural frequency) and ζ (damping ratio) after training."))
     cells.append(code(CIRCUIT_REPORT_CELL))
 
-    cells.append(md("## 10 · Sparsity analysis"))
+    cells.append(md("## 9 · Sparsity analysis"))
     cells.append(code(SPARSITY_ANALYSIS_CELL))
 
-    cells.append(md("## 11 · Visualisations"))
+    cells.append(md("## 10 · Visualisations"))
     cells.append(code(PLOT_CELL))
 
-    cells.append(md("## 12 · Text generation"))
+    cells.append(md("## 11 · Text generation"))
     cells.append(code(GENERATE_CELL))
 
     cells.append(md(
