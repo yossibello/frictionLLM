@@ -253,18 +253,23 @@ model_f = FrictionLM(cfg_f).to(device)
 print(f"FrictionLM: {model_f.param_count()/1e6:.1f}M params")
 
 history_f, model_f = train_model(model_f, train_ds, val_ds,
-                                  max_steps=600, batch_size=16, label="FrictionLM")
+                                  max_steps=1000, batch_size=16, label="FrictionLM")
 """
 
 RLC_TRAIN_CELL = """\
 cfg_r = FrictionConfig.small()
 cfg_r.max_seq_len = 256
-cfg_r.use_rlc = True
+cfg_r.use_rlc     = True
+# RLC charge q ≈ dt²×V ≈ 0.01×V — much smaller than raw gate signal.
+# Lower μ_s so charge can actually break through the threshold.
+cfg_r.mu_s_init   = 0.05   # was 0.5 — charge lives in 0.01–0.1 range
+cfg_r.rlc_dt      = 0.3    # larger step → more charge per layer (was 0.1)
 model_r = RLCFrictionLM(cfg_r).to(device)
 print(f"RLCFrictionLM: {model_r.param_count()/1e6:.1f}M params")
+print(f"μ_s={cfg_r.mu_s_init}  dt={cfg_r.rlc_dt}  (tuned for charge scale)")
 
 history_r, model_r = train_model(model_r, train_ds, val_ds,
-                                  max_steps=600, batch_size=16, label="RLCFrictionLM")
+                                  max_steps=1000, batch_size=16, label="RLCFrictionLM")
 """
 
 CIRCUIT_REPORT_CELL = """\
