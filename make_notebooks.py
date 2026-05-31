@@ -139,6 +139,9 @@ class TokenDataset:
         self.data    = np.memmap(path, dtype=np.uint16, mode="r")
         self.seq_len = seq_len
 
+    def __len__(self):
+        return max(0, len(self.data) - self.seq_len - 1)
+
     def get_batch(self, batch_size, device):
         ix = torch.randint(len(self.data) - self.seq_len - 1, (batch_size,))
         x  = torch.stack([torch.from_numpy(self.data[i:i+self.seq_len].astype(np.int64)) for i in ix])
