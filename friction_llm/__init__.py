@@ -1,4 +1,5 @@
 from .config import FrictionConfig
+from .baseline import BaselineLM
 from .friction_gate import FrictionGate, FGLUBlock
 from .attention import CausalSelfAttention
 from .block import FrictionTransformerBlock
@@ -10,6 +11,7 @@ from .rlc_model import RLCFrictionLM
 
 __all__ = [
     "FrictionConfig",
+    "BaselineLM",
     "FrictionGate",
     "FGLUBlock",
     "CausalSelfAttention",

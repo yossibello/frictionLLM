@@ -100,13 +100,18 @@ print("Working dir:", os.getcwd())
 
 IMPORT_CELL = """\
 from friction_llm import (
-    FrictionConfig, RLCFrictionLM, SharpnessCurriculum, RLCNeuron
+    FrictionConfig, RLCFrictionLM, BaselineLM,
+    SharpnessCurriculum, RLCNeuron
 )
 cfg_test = FrictionConfig.tiny()
 cfg_test.use_rlc = True
-m = RLCFrictionLM(cfg_test)
-print(f"Import OK — tiny test model: {m.param_count()/1e6:.1f}M params")
-del m, cfg_test
+m_rlc  = RLCFrictionLM(cfg_test)
+m_base = BaselineLM(cfg_test)
+print(f"Import OK")
+print(f"  RLCFrictionLM (tiny): {m_rlc.param_count()/1e6:.2f}M params")
+print(f"  BaselineLM    (tiny): {m_base.param_count()/1e6:.2f}M params")
+print(f"  Param difference    : {(m_rlc.param_count()-m_base.param_count())/1e3:.1f}K  (L,R,C overhead)")
+del m_rlc, m_base, cfg_test
 """
 
 DATA_CELL = """\
@@ -175,7 +180,7 @@ print(f"Val     : {len(val_ds):,} positions")
 """
 
 TRAIN_FUNC_CELL = """\
-from friction_llm import FrictionConfig, RLCFrictionLM, SharpnessCurriculum
+from friction_llm import FrictionConfig, RLCFrictionLM, BaselineLM, SharpnessCurriculum
 
 def unwrap(model):
     return model.module if isinstance(model, nn.DataParallel) else model
@@ -495,7 +500,27 @@ def build_kaggle():
     cells.append(code(TRAIN_FUNC_CELL))
 
     cells.append(md(
-        "## 6 · Train — RLCFrictionLM (117M params, 10 000 steps)\n\n"
+        "## 6 · Train — Baseline GPT-2 (control experiment)\n\n"
+        "Standard transformer: same size, same data, same steps — **no physics**.\n"
+        "This is the control. RLC must beat this to prove the architecture works."
+    ))
+    cells.append(code(
+        "cfg_b = FrictionConfig.medium()\n"
+        "cfg_b.max_seq_len = SEQ_LEN\n"
+        "baseline = BaselineLM(cfg_b).to(device)\n"
+        "print(f'BaselineLM: {baseline.param_count()/1e6:.1f}M params  (standard GELU FFN)')\n"
+        "\n"
+        "# Reuse train_rlc — baseline has no RLC state, circuit_report returns None\n"
+        "# so sparsity defaults to 0 and circuit cols are skipped automatically\n"
+        "history_base, baseline = train_rlc(\n"
+        "    baseline, train_ds, val_ds,\n"
+        "    max_steps=10000, batch_size=8, lr=3e-4,\n"
+        "    log_every=100, ckpt_every=1000, ckpt_dir='checkpoints/baseline',\n"
+        ")\n"
+    ))
+
+    cells.append(md(
+        "## 7 · Train — RLCFrictionLM (117M params, 10 000 steps)\n\n"
         "Expected time on 2× T4: **~3 hours**.\n"
         "Checkpoints saved every 1 000 steps → session can be resumed.\n\n"
         "Key milestones to watch:\n"
@@ -506,16 +531,60 @@ def build_kaggle():
     ))
     cells.append(code(RLC_TRAIN_CELL))
 
-    cells.append(md("## 7 · Circuit physics report"))
+    cells.append(md("## 8 · Head-to-head: RLC vs Baseline\n\nThe definitive test — same params, same data, same steps. Who wins?"))
+    cells.append(code(
+        "import matplotlib.pyplot as plt\n"
+        "\n"
+        "fig, axes = plt.subplots(1, 3, figsize=(16, 4))\n"
+        "fig.suptitle('RLCFrictionLM vs Standard Transformer — same size, same data, same steps',\n"
+        "             fontweight='bold')\n"
+        "\n"
+        "steps_b = history_base['step']\n"
+        "steps_r = history['step']\n"
+        "\n"
+        "ax = axes[0]\n"
+        "ax.plot(steps_b, history_base['val_loss'], label='Baseline (GELU)', color='gray', lw=2)\n"
+        "ax.plot(steps_r, history['val_loss'], label='RLC+Friction', color='steelblue', lw=2)\n"
+        "ax.set(xlabel='Step', ylabel='Val Loss', title='Validation Loss  ← lower is better')\n"
+        "ax.legend(); ax.grid(alpha=0.3)\n"
+        "\n"
+        "ax = axes[1]\n"
+        "ax.plot(steps_b, history_base['loss'], color='gray', alpha=0.7, lw=1.5, label='Baseline')\n"
+        "ax.plot(steps_r, history['loss'], color='steelblue', alpha=0.7, lw=1.5, label='RLC')\n"
+        "ax.set(xlabel='Step', ylabel='Train Loss', title='Training Loss')\n"
+        "ax.legend(); ax.grid(alpha=0.3)\n"
+        "\n"
+        "ax = axes[2]\n"
+        "ax.plot(steps_r, [s*100 for s in history['sparsity']], color='steelblue', lw=2, label='RLC')\n"
+        "ax.axhline(0, color='gray', lw=2, label='Baseline (always 0%)')\n"
+        "ax.axhline(70, color='green', lw=1, linestyle='--', label='CPU target')\n"
+        "ax.set(xlabel='Step', ylabel='Sparsity %', title='Gate Sparsity  (inference advantage)', ylim=[-5,105])\n"
+        "ax.legend(); ax.grid(alpha=0.3)\n"
+        "\n"
+        "plt.tight_layout()\n"
+        "plt.savefig('rlc_vs_baseline.png', dpi=150, bbox_inches='tight')\n"
+        "plt.show()\n"
+        "\n"
+        "final_base = history_base['val_loss'][-1]\n"
+        "final_rlc  = history['val_loss'][-1]\n"
+        "diff = final_base - final_rlc\n"
+        "winner = 'RLC wins' if diff > 0 else 'Baseline wins' if diff < -0.01 else 'Tie'\n"
+        "print(f'\\nBaseline val loss : {final_base:.4f}')\n"
+        "print(f'RLC      val loss : {final_rlc:.4f}')\n"
+        "print(f'Gap               : {diff:+.4f}  →  {winner}')\n"
+        "print(f'RLC sparsity      : {history[\"sparsity\"][-1]:.1%}  (baseline = 0%  — sparse inference is free)')\n"
+    ))
+
+    cells.append(md("## 9 · Circuit physics report"))
     cells.append(code(CIRCUIT_REPORT_CELL))
 
-    cells.append(md("## 8 · Visualise circuit evolution"))
+    cells.append(md("## 10 · Circuit evolution plots"))
     cells.append(code(PHYSICS_PLOT_CELL))
 
-    cells.append(md("## 9 · Sparsity detail"))
+    cells.append(md("## 11 · Sparsity detail"))
     cells.append(code(SPARSITY_CELL))
 
-    cells.append(md("## 10 · Text generation"))
+    cells.append(md("## 12 · Text generation"))
     cells.append(code(GENERATE_CELL))
 
     cells.append(md(RESUME_MD))
