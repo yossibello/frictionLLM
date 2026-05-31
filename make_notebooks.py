@@ -208,9 +208,15 @@ def train_model(model, train_ds, val_ds, max_steps=600, batch_size=16,
     history = {"step": [], "loss": [], "val_loss": [], "sparsity": []}
     t0 = time.time()
 
+    lr_min = lr / 10
     for step in range(max_steps + 1):
-        warmup = 200
-        cur_lr = lr * min(step / warmup, 1.0)
+        # Linear warmup then cosine decay
+        warmup = min(500, max_steps // 10)
+        if step < warmup:
+            cur_lr = lr * step / warmup
+        else:
+            progress = (step - warmup) / (max_steps - warmup)
+            cur_lr = lr_min + 0.5 * (lr - lr_min) * (1 + math.cos(math.pi * progress))
         for pg in optimizer.param_groups:
             pg["lr"] = cur_lr
 
