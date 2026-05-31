@@ -66,6 +66,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Fixed seed — both models see batches sampled from same distribution
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
 device = (
     torch.device("cuda") if torch.cuda.is_available() else
     torch.device("mps")  if torch.backends.mps.is_available() else
