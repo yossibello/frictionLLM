@@ -121,7 +121,43 @@ class CoupledOscillatorMixer(nn.Module):
         """Approximate wave speed along the chain: v = 1/√(L_c·C)"""
         return 1.0 / (self.L_c * self.C).sqrt()
 
-    # ── Forward ───────────────────────────────────────────────────────────────
+    # ── Impulse response ─────────────────────────────────────────────────────
+
+    def _impulse_response(self, T: int) -> torch.Tensor:
+        """
+        Compute h[t] = q-component of A^t @ B_input for t = 0..T-1.
+
+        The RLC system is linear time-invariant (A is constant across positions).
+        Its full output = causal convolution of V with this impulse response.
+
+        A = [[beta_q,  beta_i ],    B_input = [delta]    C = [1, 0]
+             [alpha_q, alpha_i]]              [gamma]
+
+        h[t] propagated via: p_q[t+1] = beta_q*p_q[t] + beta_i*p_i[t]
+                                         p_i[t+1] = alpha_q*p_q[t] + alpha_i*p_i[t]
+        This inner loop is over tiny [d] tensors — much faster than the full scan.
+        """
+        # ── Per-neuron state-transition coefficients ──────────────────────────
+        alpha_i = 1.0 - self.R * self.dt / self.L
+        alpha_q = self.dt * (-1.0 / (self.L * self.C) + 1.0 / (self.L * self.L_c))
+        gamma   = self.dt / self.L
+        beta_q  = 1.0 + alpha_q * self.dt
+        beta_i  = alpha_i * self.dt
+        delta   = gamma * self.dt
+
+        # ── Propagate A^t @ B_input ────────────────────────────────────────────
+        p_q = delta.clone()    # [d_inner]  — q-component of A^0 @ B
+        p_i = gamma.clone()    # [d_inner]  — i-component
+
+        h = [p_q]
+        for _ in range(1, T):
+            p_q, p_i = (beta_q * p_q + beta_i * p_i,
+                        alpha_q * p_q + alpha_i * p_i)
+            h.append(p_q)
+
+        return torch.stack(h, dim=0)   # [T, d_inner]
+
+    # ── Forward (FFT parallel scan) ───────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -132,36 +168,28 @@ class CoupledOscillatorMixer(nn.Module):
         Returns
         ───────
         [B, T, d_model]  — wave-mixed token representations
+
+        Implementation
+        ──────────────
+        Old: Python for-loop over T → 256 sequential CUDA kernel launches
+        New: FFT causal convolution → 3 CUDA calls regardless of T
+
+        y[b,t,d] = sum_{k=0}^{t} h[t-k, d] * V[b, k, d]
+                 = IFFT(FFT(h) × FFT(V))   [O(T log T), fully parallel]
         """
         B, T, _ = x.shape
-        V = self.proj_in(x)          # [B, T, d_inner]  applied voltage at each node
+        V = self.proj_in(x)          # [B, T, d_inner]
 
-        # Initial wave state (charge and current both zero before any signal)
-        q      = x.new_zeros(B, self.d_inner)   # charge at current node
-        i_scan = x.new_zeros(B, self.d_inner)   # current flowing through chain
+        h  = self._impulse_response(T)      # [T, d_inner]
 
-        outputs = []
+        # ── Causal convolution via FFT ────────────────────────────────────────
+        n  = 2 * T                          # zero-pad to avoid circular wrap
+        H  = torch.fft.rfft(h,  n=n, dim=0)       # [n//2+1, d_inner]
+        U  = torch.fft.rfft(V,  n=n, dim=1)       # [B, n//2+1, d_inner]
+        Y  = torch.fft.irfft(H.unsqueeze(0) * U,
+                              n=n, dim=1)[:, :T]   # [B, T, d_inner]
 
-        for t in range(T):
-            v_t = V[:, t]            # [B, d_inner]  voltage at node t
-
-            # ── Coupling force from left neighbour (position t-1) ─────────────
-            # Proportional to charge difference — wave pressure pushing right
-            # At t=0 q=0 and there's no left neighbour → coupling = 0 naturally
-            coupling = q / self.L_c   # simplified: previous charge drives new node
-
-            # ── RLC dynamics + coupling ───────────────────────────────────────
-            # L·di/dt = V_t − R·i − q/C + coupling_force
-            di    = (v_t - self.R * i_scan - q / self.C + coupling) / self.L
-            i_new = (i_scan + di * self.dt).clamp(-self.clamp, self.clamp)
-            q_new = (q     + i_new * self.dt).clamp(-self.clamp, self.clamp)
-
-            outputs.append(q_new)
-            q      = q_new
-            i_scan = i_new
-
-        y = torch.stack(outputs, dim=1)   # [B, T, d_inner]
-        y = self.norm(y)
+        y = self.norm(Y)
         return self.proj_out(y)
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
