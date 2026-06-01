@@ -45,6 +45,9 @@ class FrictionConfig:
     rlc_clamp: float = 10.0             # hard clamp on (q,i) to prevent blowup
     rlc_filter_mode: str = "lowpass"    # lowpass | highpass | bandpass | notch | learnable
 
+    # ── CoulombLM — electric force attention ────────────────────────────────
+    coulomb_r_power: float = 2.0        # distance exponent (2 = Coulomb, 1 = linear)
+
     # ── PhysicsLM — Coupled Oscillator Mixer (replaces attention) ────────────
     use_coupled_mixer: bool = False     # True = PhysicsLM (no attention)
     mixer_L_c_init: float = 5.0        # coupling inductance between adjacent tokens

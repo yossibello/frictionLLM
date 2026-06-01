@@ -3,6 +3,8 @@ from .baseline import BaselineLM
 from .coupled_mixer import CoupledOscillatorMixer
 from .physics_block import PhysicsBlock
 from .physics_model import PhysicsLM
+from .coulomb_attention import CoulombAttention
+from .coulomb_model import CoulombLM
 from .friction_gate import FrictionGate, FGLUBlock
 from .attention import CausalSelfAttention
 from .block import FrictionTransformerBlock
@@ -18,6 +20,8 @@ __all__ = [
     "CoupledOscillatorMixer",
     "PhysicsBlock",
     "PhysicsLM",
+    "CoulombAttention",
+    "CoulombLM",
     "FrictionGate",
     "FGLUBlock",
     "CausalSelfAttention",
