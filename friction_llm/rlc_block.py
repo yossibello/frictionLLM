@@ -40,6 +40,7 @@ class RLCTransformerBlock(nn.Module):
             C_init=config.rlc_C_init,
             dt=config.rlc_dt,
             clamp=config.rlc_clamp,
+            filter_mode=config.rlc_filter_mode,
         )
 
     def forward(

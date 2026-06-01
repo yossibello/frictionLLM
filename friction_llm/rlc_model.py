@@ -158,6 +158,7 @@ class RLCFrictionLM(nn.Module):
 
         for i, block in enumerate(self.blocks):
             stats = block.rlc_block.diagnostics(block.ln2(x))
+            stats["filter_weights"] = block.rlc_block.rlc.filter_weights()
             report[f"layer_{i}"] = stats
             x, rlc_state, momentum = block(x, rlc_state, momentum)
 
@@ -181,17 +182,23 @@ class RLCFrictionLM(nn.Module):
 
     def print_circuit_report(self, idx: torch.Tensor) -> None:
         """Pretty-print the per-layer circuit stats."""
-        report = self.circuit_report(idx)
+        report   = self.circuit_report(idx)
+        learnable = self.config.rlc_filter_mode == "learnable"
 
-        print("\n── RLC Circuit Report ─────────────────────────────────────────────")
-        print(f"{'Layer':<10} {'ω₀ mean':>10} {'ζ mean':>10} "
-              f"{'Underdamp%':>12} {'Sparsity':>10} {'μ_s':>8} {'μ_k':>8}")
-        print("─" * 72)
+        hdr = (f"{'Layer':<10} {'ω₀ mean':>10} {'ζ mean':>10} "
+               f"{'Underdamp%':>12} {'Sparsity':>10} {'μ_s':>8} {'μ_k':>8}")
+        if learnable:
+            hdr += f"  {'LP%':>6} {'BP%':>6} {'HP%':>6}"
+        width = len(hdr)
+
+        print(f"\n── RLC Circuit Report {'─' * (width - 22)}")
+        print(hdr)
+        print("─" * width)
 
         for key, val in report.items():
             if not isinstance(val, dict):
                 continue
-            print(
+            row = (
                 f"{key:<10} "
                 f"{val['omega_0_mean']:>10.3f} "
                 f"{val['zeta_mean']:>10.3f} "
@@ -200,8 +207,14 @@ class RLCFrictionLM(nn.Module):
                 f"{val['mu_s_mean']:>8.4f} "
                 f"{val['mu_k_mean']:>8.4f}"
             )
+            if learnable:
+                fw = val.get("filter_weights", {})
+                row += (f"  {fw.get('lowpass',0):>5.1f}%"
+                        f" {fw.get('bandpass',0):>5.1f}%"
+                        f" {fw.get('highpass',0):>5.1f}%")
+            print(row)
 
-        print("─" * 72)
+        print("─" * width)
         print(f"{'OVERALL':<10} {'':>10} {'':>10} {'':>12} "
               f"{report['overall_sparsity']:>9.1%}")
         print()

@@ -8,32 +8,30 @@ Physics equations (series RLC / damped oscillator)
     L  inductance  ↔  mass       — inertia, resists change in current
     R  resistance  ↔  damping    — dissipates energy (our friction)
     C  capacitance ↔  1/spring   — stores charge, creates restoring force
-    V(t)           ↔  applied force  — input signal from layer below
-    q              ↔  position   — charge (neuron's accumulated state)
-    i = dq/dt      ↔  velocity   — current (rate of change)
+    V(t)           ↔  applied force  — input signal
+    q              ↔  position   — accumulated charge
+    i = dq/dt      ↔  velocity   — current
 
-Rewritten as first-order system (state: q, i):
-    dq/dt  =  i
-    di/dt  =  ( V  −  R·i  −  q/C )  /  L
+Filter types from one RLC circuit
+───────────────────────────────────
+V splits across three components: V = V_L + V_R + V_C
 
-Integration: symplectic (semi-implicit) Euler — stable for oscillatory systems:
-    i[t+1]  =  i[t]  +  di · dt        (update current first)
-    q[t+1]  =  q[t]  +  i[t+1] · dt   (update charge with NEW current)
+    V_C = q          → LOW-PASS   voltage across capacitor (what we output by default)
+    V_R = R · i      → BAND-PASS  voltage across resistor
+    V_L = V−V_R−V_C  → HIGH-PASS  voltage across inductor
+    V_C + V_L        → NOTCH      everything except the resonant band
 
-Three dynamical regimes — emerge naturally from learned L, R, C:
-    ζ > 1  overdamped   : slow stable crawl, no oscillation
-    ζ = 1  critical     : fastest response without overshoot  (init target)
-    ζ < 1  underdamped  : rings at ω₀ = 1/√(LC), amplifies resonant inputs
-
-Stacking across layers (depth = time)
-──────────────────────────────────────
-The circuit state (q, i) from layer L is passed as the initial state to layer
-L+1.  Charge accumulated deep in the circuit seeds the next stage — like a
-ladder network of RLC filters, each tuned to a different frequency band.
+filter_mode controls which output the neuron uses:
+    "lowpass"   — original behaviour, backward-compatible
+    "highpass"  — only fast-changing signal passes
+    "bandpass"  — only signal near ω₀ passes
+    "notch"     — ω₀ band is suppressed
+    "learnable" — per-neuron learned mix of V_C, V_R, V_L
+                  starts as ~95% low-pass; network can evolve any filter shape
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,39 +40,57 @@ import torch.nn.functional as F
 from .friction_gate import FrictionGate
 
 
+FILTER_MODES = ("lowpass", "highpass", "bandpass", "notch", "learnable")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RLCNeuron(nn.Module):
     """
-    Per-neuron RLC circuit with learnable L, R, C.
+    Per-neuron RLC circuit with learnable L, R, C and configurable filter type.
 
-    All three parameters are stored as log values → always positive.
-    Initialized to critical damping (ζ = 1) by default, meaning the circuit
-    reaches equilibrium as fast as possible without oscillating.  The network
-    is free to learn underdamped (resonant) or overdamped neurons.
-
-    State: (q, i) — charge and current — shape [..., size].
-    Passed from one transformer block to the next (depth stacking).
+    filter_mode
+    ───────────
+    "lowpass"   → output q  (voltage across C — original behaviour)
+    "highpass"  → output V_L = V − V_R − V_C
+    "bandpass"  → output V_R = R · i
+    "notch"     → output V_C + V_L
+    "learnable" → output w_C·V_C + w_R·V_R + w_L·V_L
+                  where w are learned per-neuron softmax weights
+                  init: 95% low-pass → network evolves to whatever it needs
     """
 
     def __init__(
         self,
         size: int,
         L_init: float = 1.0,
-        R_init: float = 2.0,   # 2·√(L/C) = 2.0 → ζ = 1 when L=C=1
+        R_init: float = 2.0,
         C_init: float = 1.0,
         dt: float = 0.1,
         clamp: float = 10.0,
+        filter_mode: str = "lowpass",
     ) -> None:
         super().__init__()
-        self.size  = size
-        self.dt    = dt
-        self.clamp = clamp
+        assert filter_mode in FILTER_MODES, \
+            f"filter_mode must be one of {FILTER_MODES}, got {filter_mode!r}"
 
-        # log parameterisation keeps L, R, C strictly positive
+        self.size        = size
+        self.dt          = dt
+        self.clamp       = clamp
+        self.filter_mode = filter_mode
+
         self.log_L = nn.Parameter(torch.full((size,), math.log(L_init)))
         self.log_R = nn.Parameter(torch.full((size,), math.log(R_init)))
         self.log_C = nn.Parameter(torch.full((size,), math.log(C_init)))
+
+        if filter_mode == "learnable":
+            # mix[0] → V_C (low-pass weight)
+            # mix[1] → V_R (band-pass weight)
+            # mix[2] → V_L (high-pass weight)
+            # Init: softmax([3,0,0]) ≈ [0.95, 0.025, 0.025] → nearly pure low-pass
+            # Network is free to move weights during training
+            self.mix = nn.Parameter(torch.zeros(3, size))
+            nn.init.constant_(self.mix[0], 3.0)
 
     # ── Circuit parameters ────────────────────────────────────────────────────
 
@@ -97,12 +113,7 @@ class RLCNeuron(nn.Module):
 
     @property
     def damping_ratio(self) -> torch.Tensor:
-        """
-        ζ = R / (2·√(L/C))
-          < 1 : underdamped  (resonant — rings at ω₀)
-          = 1 : critically damped (fastest stable response)
-          > 1 : overdamped (slow, no oscillation)
-        """
+        """ζ = R / (2·√(L/C))   <1=underdamped, 1=critical, >1=overdamped"""
         return self.R / (2.0 * (self.L / self.C).sqrt())
 
     # ── Forward ───────────────────────────────────────────────────────────────
@@ -115,12 +126,12 @@ class RLCNeuron(nn.Module):
         """
         Args
         ────
-        V     : [..., size]  applied voltage (input force from W_gate projection)
-        state : (q, i) or None — circuit state from previous layer
+        V     : [..., size]   applied voltage
+        state : (q, i) or None
 
         Returns
         ───────
-        q_new     : [..., size]  new charge (position)
+        output    : [..., size]   filtered signal (type depends on filter_mode)
         new_state : (q_new, i_new)
         """
         if state is None:
@@ -129,36 +140,77 @@ class RLCNeuron(nn.Module):
         else:
             q, i = state
 
-        # di/dt = ( V − R·i − q/C ) / L
-        di = (V - self.R * i - q / self.C) / self.L
+        # Symplectic Euler integration
+        di    = (V - self.R * i - q / self.C) / self.L
+        i_new = (i + di * self.dt).clamp(-self.clamp, self.clamp)
+        q_new = (q + i_new * self.dt).clamp(-self.clamp, self.clamp)
 
-        # Symplectic Euler: update i first, then q with new i
-        i_new = i + di * self.dt
-        q_new = q + i_new * self.dt
+        output = self._filter_output(V, q_new, i_new)
+        return output, (q_new, i_new)
 
-        # Clamp to prevent numerical blowup in early training
-        i_new = i_new.clamp(-self.clamp, self.clamp)
-        q_new = q_new.clamp(-self.clamp, self.clamp)
+    def _filter_output(
+        self, V: torch.Tensor, q: torch.Tensor, i: torch.Tensor
+    ) -> torch.Tensor:
+        """Select / mix filter outputs based on filter_mode."""
+        if self.filter_mode == "lowpass":
+            return q                        # voltage across C (default)
 
-        return q_new, (q_new, i_new)
+        v_C = q                             # low-pass
+        v_R = self.R * i                    # band-pass
+        v_L = (V - v_R - q / self.C)       # high-pass
+
+        if self.filter_mode == "highpass":
+            return v_L.clamp(-self.clamp, self.clamp)
+        if self.filter_mode == "bandpass":
+            return v_R.clamp(-self.clamp, self.clamp)
+        if self.filter_mode == "notch":
+            return (v_C + v_L).clamp(-self.clamp, self.clamp)
+
+        # "learnable"
+        w = torch.softmax(self.mix, dim=0)          # [3, size]
+        out = w[0] * v_C + w[1] * v_R + w[2] * v_L
+        return out.clamp(-self.clamp, self.clamp)
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def circuit_stats(self) -> dict:
-        return {
+        stats = {
             "omega_0_mean":  self.omega_0.mean().item(),
             "omega_0_std":   self.omega_0.std().item(),
             "zeta_mean":     self.damping_ratio.mean().item(),
             "zeta_std":      self.damping_ratio.std().item(),
             "underdamped_%": (self.damping_ratio < 1.0).float().mean().item() * 100,
             "overdamped_%":  (self.damping_ratio > 1.0).float().mean().item() * 100,
+            "filter_mode":   self.filter_mode,
+        }
+        if self.filter_mode == "learnable":
+            w = torch.softmax(self.mix, dim=0).mean(dim=1)  # [3]
+            stats["mix_lowpass_%"]  = w[0].item() * 100
+            stats["mix_bandpass_%"] = w[1].item() * 100
+            stats["mix_highpass_%"] = w[2].item() * 100
+        return stats
+
+    @torch.no_grad()
+    def filter_weights(self) -> Dict[str, float]:
+        """
+        Human-readable filter composition.
+        For fixed modes returns 100% of that type.
+        For 'learnable' returns per-neuron average weights.
+        """
+        if self.filter_mode != "learnable":
+            return {self.filter_mode: 100.0}
+        w = torch.softmax(self.mix, dim=0).mean(dim=1)
+        return {
+            "lowpass":  round(w[0].item() * 100, 1),
+            "bandpass": round(w[1].item() * 100, 1),
+            "highpass": round(w[2].item() * 100, 1),
         }
 
     def extra_repr(self) -> str:
         ω = self.omega_0.mean().item()
         ζ = self.damping_ratio.mean().item()
-        return f"size={self.size}, ω₀≈{ω:.3f}, ζ≈{ζ:.3f}, dt={self.dt}"
+        return f"size={self.size}, ω₀≈{ω:.3f}, ζ≈{ζ:.3f}, dt={self.dt}, filter={self.filter_mode}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,30 +219,7 @@ class RLCFrictionBlock(nn.Module):
     """
     Full circuit neuron: RLC dynamics + friction gate + GLU projection.
 
-    Signal path
-    ───────────
-        gate_signal = W_gate(x)          [d_model → d_ff]  "applied voltage"
-        value       = W_up(x)            [d_model → d_ff]  content carrier
-
-        q, (q,i) = RLC(gate_signal, prev_state)     circuit dynamics
-        gated, momentum = FrictionGate(q, momentum) static/kinetic filter
-                                                     on accumulated charge
-
-        output = W_out( gated ⊙ value )  [d_ff → d_model]
-
-    Why friction on charge (q), not on raw voltage (V)?
-    ────────────────────────────────────────────────────
-    A capacitor charges up over layers.  The friction gate fires only when
-    accumulated charge exceeds μ_s — like a defibrillator capacitor that
-    builds until it breaks through the threshold, then discharges with kinetic
-    drag μ_k.  Single-shot voltage (V) hitting the gate would degrade to a
-    plain threshold activation; charge (q) carries the circuit history.
-
-    Stacking
-    ────────
-    Block returns (q_new, i_new) as new_state.  The next block receives this
-    as its initial state — charge and current carry over, creating a ladder
-    network of coupled RLC filters across depth.
+    filter_mode is passed through to RLCNeuron — see RLCNeuron docstring.
     """
 
     def __init__(
@@ -210,6 +239,7 @@ class RLCFrictionBlock(nn.Module):
         C_init: float = 1.0,
         dt: float = 0.1,
         clamp: float = 10.0,
+        filter_mode: str = "lowpass",
     ) -> None:
         super().__init__()
         self.W_gate = nn.Linear(d_model, d_ff, bias=bias)
@@ -221,6 +251,7 @@ class RLCFrictionBlock(nn.Module):
             size=d_ff,
             L_init=L_init, R_init=R_init, C_init=C_init,
             dt=dt, clamp=clamp,
+            filter_mode=filter_mode,
         )
         self.friction = FrictionGate(
             size=d_ff,
@@ -237,36 +268,20 @@ class RLCFrictionBlock(nn.Module):
         x: torch.Tensor,
         rlc_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         momentum: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor,
-               Tuple[torch.Tensor, torch.Tensor],
-               torch.Tensor]:
-        """
-        Args
-        ────
-        x         : [B, T, d_model]
-        rlc_state : (q, i) each [B, T, d_ff], or None
-        momentum  : [B, T, d_ff] or None
-
-        Returns
-        ───────
-        output    : [B, T, d_model]
-        new_state : (q_new, i_new)  — passed to next block
-        new_mom   : [B, T, d_ff]   — passed to next block
-        """
-        V = self.W_gate(x)                                    # applied voltage
-        q, new_state = self.rlc(V, rlc_state)                # circuit dynamics
-        gated, new_mom = self.friction(q, momentum)           # friction on charge
-        out = self.drop(self.W_out(gated * self.W_up(x)))     # GLU output
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        V              = self.W_gate(x)
+        filtered, new_state = self.rlc(V, rlc_state)
+        gated, new_mom      = self.friction(filtered, momentum)
+        out                 = self.drop(self.W_out(gated * self.W_up(x)))
         return out, new_state, new_mom
 
     @torch.no_grad()
     def diagnostics(self, x: torch.Tensor) -> dict:
-        """Per-block physics stats for monitoring during training."""
         V = self.W_gate(x)
-        q, _ = self.rlc(V)
-        sparsity = self.friction.measure_sparsity(q)
-        stats = self.rlc.circuit_stats()
-        stats["sparsity"] = sparsity
+        filtered, _ = self.rlc(V)
+        sparsity    = self.friction.measure_sparsity(filtered)
+        stats       = self.rlc.circuit_stats()
+        stats["sparsity"]  = sparsity
         stats["mu_s_mean"] = self.friction.mu_s.mean().item()
         stats["mu_k_mean"] = self.friction.mu_k.mean().item()
         return stats

@@ -43,6 +43,7 @@ class FrictionConfig:
     rlc_R_init: float = 2.0             # initial resistance — 2.0 = critical damping when L=C=1
     rlc_C_init: float = 1.0             # initial capacitance (per neuron)
     rlc_clamp: float = 10.0             # hard clamp on (q,i) to prevent blowup
+    rlc_filter_mode: str = "lowpass"    # lowpass | highpass | bandpass | notch | learnable
 
     # ── Friction Attention (Phase 2 — off by default) ─────────────────────────
     use_friction_attention: bool = False

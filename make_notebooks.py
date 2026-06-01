@@ -360,23 +360,25 @@ def train_rlc(model, train_ds, val_ds,
 RLC_TRAIN_CELL = """\
 # Medium config: 117M params, 12 layers — right size for WikiText-103
 cfg = FrictionConfig.medium()
-cfg.max_seq_len = SEQ_LEN
-cfg.use_rlc     = True
-cfg.mu_s_init   = 0.05   # charge scale is ~dt²×V, much smaller than raw signal
-cfg.rlc_dt      = 0.3    # larger step → more charge per layer
+cfg.max_seq_len     = SEQ_LEN
+cfg.use_rlc         = True
+cfg.mu_s_init       = 0.05        # charge scale is ~dt²×V, much smaller than raw signal
+cfg.rlc_dt          = 0.3         # larger step → more charge per layer
+cfg.rlc_filter_mode = "learnable" # each neuron learns its own LP/BP/HP mix
+                                   # change to "lowpass" to reproduce original behaviour
 
 model = RLCFrictionLM(cfg).to(device)
-print(f"RLCFrictionLM: {model.param_count()/1e6:.1f}M params")
-print(f"Layers: {cfg.n_layers}  d_model: {cfg.d_model}  d_ff: {cfg.d_ff}")
+print(f"RLCFrictionLM  : {model.param_count()/1e6:.1f}M params")
+print(f"Layers         : {cfg.n_layers}  d_model: {cfg.d_model}")
+print(f"Filter mode    : {cfg.rlc_filter_mode}")
 print(f"μ_s={cfg.mu_s_init}  rlc_dt={cfg.rlc_dt}")
 print()
-print("Training for 10 000 steps — circuit physics will emerge after ~2 000")
-print("Watch: ω₀ spread (frequency divergence) + underdamped layers (resonance)")
+print("Watch: ω₀ spread, underdamped layers, AND filter weights evolving per layer")
 
 history, model = train_rlc(
     model, train_ds, val_ds,
     max_steps=10000,
-    batch_size=8,      # 8 per GPU × 2 GPUs = 16 effective (fits in T4 16 GB)
+    batch_size=8,
     lr=3e-4,
     log_every=100,
     ckpt_every=1000,
@@ -643,7 +645,50 @@ def build_kaggle():
     cells.append(md("## 9 · Circuit physics report"))
     cells.append(code(CIRCUIT_REPORT_CELL))
 
-    cells.append(md("## 10 · Circuit evolution plots"))
+    cells.append(md(
+        "## 10 · Filter weights per layer\n\n"
+        "What filter type did each layer learn? "
+        "LP=low-pass (slow/global), BP=band-pass (resonant/selective), HP=high-pass (fast/local)."
+    ))
+    cells.append(code(
+        "model.eval()\n"
+        "sample, _ = val_ds.get_batch(4, device)\n"
+        "report = model.circuit_report(sample)\n"
+        "\n"
+        "import matplotlib.pyplot as plt\n"
+        "import numpy as np\n"
+        "\n"
+        "n_layers = model.config.n_layers\n"
+        "lp, bp, hp = [], [], []\n"
+        "for i in range(n_layers):\n"
+        "    fw = report[f'layer_{i}']['filter_weights']\n"
+        "    lp.append(fw.get('lowpass',  0))\n"
+        "    bp.append(fw.get('bandpass', 0))\n"
+        "    hp.append(fw.get('highpass', 0))\n"
+        "\n"
+        "x = np.arange(n_layers)\n"
+        "fig, ax = plt.subplots(figsize=(12, 4))\n"
+        "ax.bar(x, lp, label='Low-pass  (slow/global)',      color='#4878cf')\n"
+        "ax.bar(x, bp, bottom=lp, label='Band-pass (resonant)',  color='#6acc65')\n"
+        "ax.bar(x, hp, bottom=[l+b for l,b in zip(lp,bp)],\n"
+        "       label='High-pass (fast/local)', color='#d65f5f')\n"
+        "ax.set(xlabel='Layer', ylabel='Filter weight %', ylim=[0,100],\n"
+        "       title='Learned Filter Type per Layer  (emerged from training)',\n"
+        "       xticks=x, xticklabels=[f'L{i}' for i in range(n_layers)])\n"
+        "ax.legend(); ax.grid(alpha=0.3, axis='y')\n"
+        "plt.tight_layout()\n"
+        "plt.savefig('filter_weights.png', dpi=150, bbox_inches='tight')\n"
+        "plt.show()\n"
+        "\n"
+        "print('\\nFilter composition per layer:')\n"
+        "for i in range(n_layers):\n"
+        "    fw = report[f'layer_{i}']['filter_weights']\n"
+        "    dominant = max(fw, key=fw.get)\n"
+        "    print(f'  Layer {i:2d}: LP={lp[i]:5.1f}%  BP={bp[i]:5.1f}%  '\n"
+        "          f'HP={hp[i]:5.1f}%  → {dominant}')\n"
+    ))
+
+    cells.append(md("## 11 · Circuit evolution plots"))
     cells.append(code(PHYSICS_PLOT_CELL))
 
     cells.append(md("## 11 · Sparsity detail"))
