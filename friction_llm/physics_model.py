@@ -143,6 +143,10 @@ class PhysicsLM(nn.Module):
         ) / self.config.n_layers
         return report
 
+    def circuit_report(self, idx: torch.Tensor) -> dict:
+        """Alias for wave_report — lets train_rlc work with PhysicsLM."""
+        return self.wave_report(idx)
+
     def print_wave_report(self, idx: torch.Tensor) -> None:
         report = self.wave_report(idx)
         print("\n── PhysicsLM Wave Report ──────────────────────────────────────────")

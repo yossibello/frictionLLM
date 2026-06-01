@@ -206,9 +206,23 @@ def circuit_snapshot(base):
     \"\"\"Per-layer ω₀, ζ, underdamped %, sparsity — for live monitoring.\"\"\"
     rows = []
     for block in base.blocks:
-        # RLCTransformerBlock has rlc_block; PhysicsBlock has filter; BaselineBlock has none
+        # RLCTransformerBlock → rlc_block
+        # PhysicsBlock        → filter (RLCFrictionBlock) and mixer (CoupledOscillatorMixer)
+        # BaselineBlock       → nothing
         rlc_block = getattr(block, "rlc_block", None) or getattr(block, "filter", None)
-        if rlc_block is not None and hasattr(rlc_block, "rlc"):
+        # For PhysicsLM, prefer the mixer's wave stats for ω₀/ζ
+        mixer = getattr(block, "mixer", None)
+        if mixer is not None and hasattr(mixer, "omega_0"):
+            # PhysicsLM: ω₀ from the wave mixer
+            fric = getattr(rlc_block, "friction", None) if rlc_block else None
+            rows.append({
+                "omega_0": mixer.omega_0.mean().item(),
+                "zeta":    mixer.damping_ratio.mean().item(),
+                "underdamped_pct": (mixer.damping_ratio < 1.0).float().mean().item() * 100,
+                "mu_s":    fric.mu_s.mean().item() if fric else 0.0,
+            })
+        elif rlc_block is not None and hasattr(rlc_block, "rlc"):
+            # RLCFrictionLM: ω₀ from the RLC FFN neuron
             rlc  = rlc_block.rlc
             fric = rlc_block.friction
             rows.append({
