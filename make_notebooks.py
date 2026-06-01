@@ -457,6 +457,50 @@ history_phy, physics_model = train_model(
 )
 """
 
+ROBUST_EVAL_CELL = """\
+# ── Robust evaluation: average over 200 val batches from each best.pt ────────
+# The single-batch val during training is noisy (±0.3 nats). This is the
+# credible number — the one to quote.
+
+@torch.no_grad()
+def eval_checkpoint(ckpt_path, model_class, n_batches=200, batch_size=8):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    cfg  = ckpt["config"]
+    m    = model_class(cfg).to(device)
+    m.load_state_dict(ckpt["model"])
+    m.eval()
+    use_amp = device.type == "cuda"
+    losses = []
+    for _ in range(n_batches):
+        x, y = val_ds.get_batch(batch_size, device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            _, loss = m(x, y)
+        losses.append(loss.item())
+    return float(np.mean(losses)), float(np.std(losses) / n_batches**0.5), cfg
+
+print(f"Evaluating each best.pt over 200 val batches ...")
+print(f"(takes ~30s per model)\\n")
+
+base_loss, base_se, _ = eval_checkpoint(
+    "/kaggle/working/checkpoints/baseline/best.pt", BaselineLM)
+phy_loss,  phy_se,  _ = eval_checkpoint(
+    "/kaggle/working/checkpoints/physics/best.pt",  PhysicsLM)
+
+import math
+print(f"{'Model':<24} {'Val loss':>9} {'±SE':>6} {'Perplexity':>11}")
+print("-" * 54)
+print(f"{'GPT-2 baseline':<24} {base_loss:>9.4f} {base_se:>6.4f} {math.exp(base_loss):>11.2f}")
+print(f"{'PhysicsLM (no attn)':<24} {phy_loss:>9.4f} {phy_se:>6.4f} {math.exp(phy_loss):>11.2f}")
+print("-" * 54)
+delta = base_loss - phy_loss
+print(f"\\nPhysicsLM {'WINS' if delta > 0 else 'LOSES'} by {abs(delta):.4f} nats "
+      f"({'%.1f' % (100*abs(delta)/base_loss)}%)")
+if abs(delta) < 3 * max(base_se, phy_se):
+    print("  ⚠  margin < 3σ — within noise, run more steps to confirm")
+else:
+    print(f"  ✓  margin is {abs(delta)/max(base_se,phy_se):.1f}σ — statistically clear")
+"""
+
 COMPARE_CELL = """\
 import matplotlib.pyplot as plt
 
@@ -466,13 +510,14 @@ runs = [
 ]
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 4.5))
-fig.suptitle('PhysicsLM vs GPT-2  —  same params budget, same data, same steps',
+fig.suptitle('PhysicsLM vs GPT-2  —  same data, same steps',
              fontweight='bold')
 
 ax = axes[0]
 for label, hist, c in runs:
     ax.plot(hist['step'], hist['val_loss'], label=label, color=c, lw=2)
-ax.set(xlabel='Step', ylabel='Val Loss', title='Validation Loss  ← lower wins')
+ax.set(xlabel='Step', ylabel='Val Loss (single batch — noisy)',
+       title='Training-time val loss  (see robust eval cell for final numbers)')
 ax.legend(); ax.grid(alpha=0.3)
 
 ax = axes[1]
@@ -492,15 +537,6 @@ ax.legend(); ax.grid(alpha=0.3)
 plt.tight_layout()
 plt.savefig('physics_vs_gpt2.png', dpi=150, bbox_inches='tight')
 plt.show()
-
-print('\\n── Final / best validation loss ─────────────────')
-for label, hist, _ in runs:
-    final = hist['val_loss'][-1]
-    best  = min(hist['val_loss'])
-    print(f'  {label:<22} final {final:.4f}   best {best:.4f}   ppl {math.exp(best):.1f}')
-winner = min(runs, key=lambda r: min(r[1]['val_loss']))[0]
-print(f'\\n  WINNER (best val): {winner}')
-print(f'  PhysicsLM FFN sparsity: {history_phy[\"sparsity\"][-1]:.1%}')
 """
 
 WAVE_REPORT_CELL = """\
@@ -670,20 +706,28 @@ def build_kaggle():
                     "RLC friction circuit replaces the FFN (sparse at inference)."))
     cells.append(code(PHYSICS_TRAIN_CELL))
 
-    cells.append(md("## 8 · Head-to-head: PhysicsLM vs GPT-2\n\nThe definitive test — who wins?"))
+    cells.append(md(
+        "## 8 · Robust evaluation — load best.pt, average 200 val batches\n\n"
+        "Training-time val is measured on **one random batch** → noisy (±0.3 nats). "
+        "This cell loads each `best.pt` and averages over 200 batches to get a "
+        "credible number with a standard error. **This is the number to quote.**"
+    ))
+    cells.append(code(ROBUST_EVAL_CELL))
+
+    cells.append(md("## 9 · Head-to-head plots: PhysicsLM vs GPT-2"))
     cells.append(code(COMPARE_CELL))
 
-    cells.append(md("## 9 · PhysicsLM training dynamics"))
+    cells.append(md("## 10 · PhysicsLM training dynamics"))
     cells.append(code(PHYSICS_PLOT_CELL))
 
-    cells.append(md("## 10 · Wave / circuit report (per layer)"))
+    cells.append(md("## 11 · Wave / circuit report (per layer)"))
     cells.append(code(WAVE_REPORT_CELL))
 
-    cells.append(md("## 11 · Learned FFN filter type per layer\n\n"
+    cells.append(md("## 12 · Learned FFN filter type per layer\n\n"
                     "LP=low-pass (slow/global), BP=band-pass (resonant), HP=high-pass (fast/local)."))
     cells.append(code(FILTER_WEIGHTS_CELL))
 
-    cells.append(md("## 12 · Text generation"))
+    cells.append(md("## 13 · Text generation"))
     cells.append(code(GENERATE_CELL))
 
     cells.append(md(RESUME_MD))
@@ -710,6 +754,8 @@ def build_jupyterhub():
     cells.append(code(BASELINE_TRAIN_CELL))
     cells.append(md("## Train PhysicsLM"))
     cells.append(code(PHYSICS_TRAIN_CELL))
+    cells.append(md("## Robust eval"))
+    cells.append(code(ROBUST_EVAL_CELL))
     cells.append(md("## Compare"))
     cells.append(code(COMPARE_CELL))
     cells.append(md("## PhysicsLM dynamics"))
