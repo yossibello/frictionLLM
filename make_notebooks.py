@@ -342,17 +342,15 @@ def train_rlc(model, train_ds, val_ds,
             )
 
         # ── Checkpoint ───────────────────────────────────────────────────────
+        # Periodic: model weights only (~470 MB). best.pt keeps full state for resuming.
         if step % ckpt_every == 0 and step > 0:
             path = f"{ckpt_dir}/rlc_step_{step:06d}.pt"
             torch.save({
-                "model":      base.state_dict(),
-                "optimizer":  optimizer.state_dict(),
-                "curriculum": curriculum.state_dict(),
-                "step":       step,
-                "history":    history,
-                "config":     base.config,
+                "model":  base.state_dict(),   # weights only — no optimizer, no history
+                "config": base.config,
+                "step":   step,
             }, path)
-            print(f"  → saved {path}")
+            print(f"  → saved {path}  (model only, ~470 MB)")
 
     return history, base
 """
