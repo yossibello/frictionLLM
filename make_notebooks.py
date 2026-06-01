@@ -206,14 +206,20 @@ def circuit_snapshot(base):
     \"\"\"Per-layer ω₀, ζ, underdamped %, sparsity — for live monitoring.\"\"\"
     rows = []
     for block in base.blocks:
-        rlc  = block.rlc_block.rlc
-        fric = block.rlc_block.friction
-        rows.append({
-            "omega_0": rlc.omega_0.mean().item(),
-            "zeta":    rlc.damping_ratio.mean().item(),
-            "underdamped_pct": (rlc.damping_ratio < 1.0).float().mean().item() * 100,
-            "mu_s":    fric.mu_s.mean().item(),
-        })
+        # RLCTransformerBlock has rlc_block; PhysicsBlock has filter; BaselineBlock has none
+        rlc_block = getattr(block, "rlc_block", None) or getattr(block, "filter", None)
+        if rlc_block is not None and hasattr(rlc_block, "rlc"):
+            rlc  = rlc_block.rlc
+            fric = rlc_block.friction
+            rows.append({
+                "omega_0": rlc.omega_0.mean().item(),
+                "zeta":    rlc.damping_ratio.mean().item(),
+                "underdamped_pct": (rlc.damping_ratio < 1.0).float().mean().item() * 100,
+                "mu_s":    fric.mu_s.mean().item(),
+            })
+        else:
+            rows.append({"omega_0": 1.0, "zeta": 1.0,
+                         "underdamped_pct": 0.0, "mu_s": 0.0})
     return rows
 
 def train_rlc(model, train_ds, val_ds,
@@ -296,11 +302,16 @@ def train_rlc(model, train_ds, val_ds,
                 if vloss.dim() > 0:
                     vloss = vloss.mean()
 
-            # Sparsity + circuit snapshot (use base model directly, no DataParallel)
+            # Sparsity + circuit snapshot (skip for models without RLC)
             sample, _ = val_ds.get_batch(4, device)
-            report  = base.circuit_report(sample)
-            sparsity = report["overall_sparsity"]
-            snap    = circuit_snapshot(base)
+            if hasattr(base, "circuit_report"):
+                report   = base.circuit_report(sample)
+                sparsity = report["overall_sparsity"]
+                snap     = circuit_snapshot(base)
+            else:
+                sparsity = 0.0   # baseline has no friction gate
+                snap     = [{"omega_0": 1.0, "zeta": 1.0}
+                            for _ in range(base.config.n_layers)]
             model.train()
 
             omegas = [r["omega_0"] for r in snap]
