@@ -207,7 +207,7 @@ def train(args: argparse.Namespace) -> None:
     # Separate physics params (mu_s, ratio, log_L/R/C) from weight-decayed params
     physics_params, other_params = [], []
     for name, p in model.named_parameters():
-        if any(k in name for k in ("raw_mu", "raw_ratio", "log_L", "log_R", "log_C")):
+        if any(k in name for k in ("raw_mu", "raw_ratio", "log_L", "log_R", "log_C", "pole_mix")):
             physics_params.append(p)
         else:
             other_params.append(p)
@@ -252,12 +252,18 @@ def train(args: argparse.Namespace) -> None:
         with autocast("cuda", enabled=use_amp):
             logits, loss = model(x, y)
 
-            # Optional sparsity regularisation (L1 on gate signals)
+            # Optional sparsity regularisation (L1 on gate signals).
+            # Block layouts differ per model:
+            #   FrictionLM   : block.fglu.W_gate      , norm = block.ln2
+            #   RLCFrictionLM: block.rlc_block.W_gate , norm = block.ln2
+            #   PhysicsLM    : block.filter.W_gate    , norm = block.ln_filt
             if config.sparsity_reg > 0:
-                sparse_loss = sum(
-                    block.fglu.W_gate(block.ln2(x)).abs().mean()
-                    for block in model.blocks
-                )
+                def _gate_l1(block):
+                    gate = getattr(block, "fglu", None) or getattr(block, "rlc_block", None) \
+                        or getattr(block, "filter", None)
+                    norm = getattr(block, "ln2", None) or getattr(block, "ln_filt", None)
+                    return gate.W_gate(norm(x)).abs().mean()
+                sparse_loss = sum(_gate_l1(block) for block in model.blocks)
                 loss = loss + config.sparsity_reg * sparse_loss
 
         scaler.scale(loss).backward()

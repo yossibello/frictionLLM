@@ -45,6 +45,7 @@ class PhysicsBlock(nn.Module):
         self.mixer   = CoupledOscillatorMixer(
             d_model  = config.d_model,
             d_inner  = config.d_model,      # same dim as model
+            n_poles  = config.mixer_n_poles,
             dt       = config.rlc_dt,
             L_c_init = config.mixer_L_c_init,
             clamp    = config.rlc_clamp,

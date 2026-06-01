@@ -36,69 +36,70 @@ emerge naturally from the circuit dynamics.
 Relationship to Mamba/S4
 ──────────────────────────
 S4/Mamba use  x[t] = Ax[t-1] + Bu[t]  with A learned freely.
-We constrain A to the physically valid RLC transmission line matrix,
-adding:
+We constrain A to the physically valid RLC oscillator, adding:
   1. Physical interpretability (L, R, C, L_c have real meaning)
-  2. Stability guarantee (positive R → eigenvalues inside unit circle)
-  3. Explicit coupling inductance L_c between adjacent positions
+  2. Stability guarantee: the kernel is the exact analytic Green's function
+     of a damped oscillator, h(t) ∝ e^{−γt}·(…) with γ = R/(2L) > 0, so it
+     decays for every t and every parameter value — unconditionally stable.
+  3. Coupling inductance L_c adds restoring stiffness to each node
+     (ω² = (1/C + 1/L_c)/L), tuning the resonant frequency of the chain.
+
+Note: this is a per-channel diagonal SSM (each channel is an independent
+2-pole resonator convolved along the sequence), not a literal spatial
+ladder — the "transmission line" is the mental model, the implementation is
+an LTI causal convolution, same family as S4D.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-@torch.jit.script
-def _impulse_loop(
-    beta_q:  torch.Tensor,
-    beta_i:  torch.Tensor,
-    alpha_q: torch.Tensor,
-    alpha_i: torch.Tensor,
-    delta:   torch.Tensor,
-    gamma:   torch.Tensor,
-    T: int,
-) -> torch.Tensor:
-    """
-    JIT-compiled impulse response loop — no Python overhead.
-    Computes h[t] = q-component of A^t @ B for t=0..T-1.
-    Runs entirely in C++, eliminates per-iteration Python→CUDA overhead.
-    """
-    d = delta.shape[0]
-    h = torch.zeros(T, d, dtype=delta.dtype, device=delta.device)
-    p_q = delta.clone()
-    p_i = gamma.clone()
-    h[0] = p_q
-    for t in range(1, T):
-        p_q_new = beta_q * p_q + beta_i * p_i
-        p_i     = alpha_q * p_q + alpha_i * p_i
-        p_q     = p_q_new
-        h[t]    = p_q
-    return h   # [T, d]
-
-
 class CoupledOscillatorMixer(nn.Module):
     """
-    1D RLC transmission line along the token dimension.
+    Multi-pole RLC resonator bank along the token dimension, with a
+    content-dependent (selective) output gate.
 
-    The scan is causal: position i's output depends only on positions 0..i-1.
-    State (q, i_scan) propagates left → right, encoding wave dynamics.
+    Each channel is no longer a single 2-pole oscillator but a BANK of
+    `n_poles` damped resonators at diverse natural frequencies, whose impulse
+    responses are mixed by learnable weights:
+
+        h_d(t) = Σ_p  w[d,p] · h_{d,p}(t)        (h_{d,p} = analytic RLC kernel)
+
+    This is the S4D upgrade: a single 2-pole filter per channel can only
+    express one resonant mode, which is far weaker than attention; a bank of
+    poles spanning a frequency range lets one channel capture both fast/local
+    and slow/global structure.
+
+    Selective gate (Mamba-style)
+    ────────────────────────────
+    The convolution itself is LTI (kernel is the same for every input).  We
+    add a content-dependent multiplicative gate on the SSM output:
+
+        y = proj_out( norm(h * V) ⊙ SiLU(proj_gate(x)) )
+
+    This recovers most of the input-dependent "selectivity" that makes Mamba
+    beat plain S4, while keeping the O(T log T) FFT convolution (true
+    input-dependent state matrices would force a sequential scan).
 
     Parameters
     ──────────
     d_model    : token embedding dimension
     d_inner    : internal oscillator dimension (defaults to d_model)
-    dt         : Euler integration step
-    L_c_init   : initial coupling inductance — large = weak coupling at start
-    clamp      : numerical stability clamp on state
+    n_poles    : resonators per channel (frequencies spread at init)
+    dt         : kernel sampling step
+    L_c_init   : initial coupling inductance (adds restoring stiffness)
+    clamp      : unused (kernel is unconditionally stable; kept for config compat)
     """
 
     def __init__(
         self,
         d_model: int,
         d_inner: Optional[int] = None,
+        n_poles: int = 8,
         dt: float = 0.1,
         L_c_init: float = 5.0,
         clamp: float = 10.0,
@@ -107,22 +108,31 @@ class CoupledOscillatorMixer(nn.Module):
         super().__init__()
         d_inner = d_inner or d_model
         self.d_inner = d_inner
+        self.n_poles = n_poles
         self.dt      = dt
         self.clamp   = clamp
 
-        # ── Per-node self RLC (same physics as RLCNeuron) ─────────────────────
-        self.log_L = nn.Parameter(torch.zeros(d_inner))
-        self.log_R = nn.Parameter(torch.full((d_inner,), math.log(2.0)))  # ζ=1
-        self.log_C = nn.Parameter(torch.zeros(d_inner))
+        # ── Per-channel, per-pole RLC (shape [d_inner, n_poles]) ──────────────
+        # Natural frequencies are spread logarithmically across the bank so the
+        # poles start diverse (identical poles would collapse the bank to one).
+        #   ω₀ = 1/√(LC); fix L=1 ⇒ C = 1/ω₀² ⇒ log_C = −2·log ω₀
+        omega = torch.logspace(math.log10(0.5), math.log10(10.0), n_poles)  # [P]
+        log_C = (-2.0 * omega.log()).unsqueeze(0).repeat(d_inner, 1)        # [d,P]
 
-        # ── Coupling inductance between adjacent nodes ─────────────────────────
-        # Large init → weak coupling → gradients learn to strengthen as needed
-        self.log_L_c = nn.Parameter(torch.full((d_inner,), math.log(L_c_init)))
+        self.log_L   = nn.Parameter(torch.zeros(d_inner, n_poles))
+        self.log_R   = nn.Parameter(torch.full((d_inner, n_poles), math.log(2.0)))
+        self.log_C   = nn.Parameter(log_C)
+        self.log_L_c = nn.Parameter(torch.full((d_inner, n_poles), math.log(L_c_init)))
+
+        # ── Per-channel mixing weights over the pole bank ─────────────────────
+        # Init 1/n_poles ⇒ kernel starts as the average of the bank (O(1) scale).
+        self.pole_mix = nn.Parameter(torch.full((d_inner, n_poles), 1.0 / n_poles))
 
         # ── Projections ───────────────────────────────────────────────────────
-        self.proj_in  = nn.Linear(d_model, d_inner, bias=bias)
-        self.proj_out = nn.Linear(d_inner, d_model, bias=bias)
-        self.norm     = nn.LayerNorm(d_inner)
+        self.proj_in   = nn.Linear(d_model, d_inner, bias=bias)
+        self.proj_gate = nn.Linear(d_model, d_inner, bias=bias)   # selective gate
+        self.proj_out  = nn.Linear(d_inner, d_model, bias=bias)
+        self.norm      = nn.LayerNorm(d_inner)
 
     # ── Circuit properties ────────────────────────────────────────────────────
 
@@ -153,25 +163,68 @@ class CoupledOscillatorMixer(nn.Module):
 
     def _impulse_response(self, T: int) -> torch.Tensor:
         """
-        Compute h[t] = q-component of A^t @ B_input for t = 0..T-1.
+        Exact analytic impulse response of the damped RLC oscillator, sampled
+        at t = n·dt for n = 0..T-1.  Returns [T, d_inner] float32.
 
-        Uses a JIT-compiled loop over tiny [d] tensors (no Python overhead).
-        Always returns float32 — FFT requires float32, not float16.
+        Continuous-time per-channel ODE
+        ────────────────────────────────
+            q̈ + 2γ q̇ + ω² q = (1/L)·δ(t)
+
+            ω² = (1/C + 1/L_c) / L   effective stiffness — the coupling
+                                      inductance L_c ADDS restoring stiffness
+                                      to the node (passive ⇒ always > 0)
+            γ  = R / (2L)            decay rate (R>0, L>0 ⇒ always > 0)
+
+        Green's function (valid for under-, over-, and critically-damped):
+            h(t) = (1/L)·(e^{s₊t} − e^{s₋t}) / (s₊ − s₋),   s± = −γ ± √(γ²−ω²)
+
+        Using complex √ makes one expression cover all damping regimes
+        (complex conjugate roots → underdamped sine, real roots → overdamped).
+
+        Why this replaced the old symplectic-Euler scan
+        ────────────────────────────────────────────────
+        The previous loop discretised the ODE explicitly, which is only
+        CONDITIONALLY stable: it diverged to ±inf once ω·dt > 2 or once the
+        (mis-signed) coupling term flipped the spring negative — both reachable
+        by the unconstrained log-space parameters during training, producing
+        NaN loss.  Because γ > 0 here, e^{−γt} decays for every t, so this
+        kernel is UNCONDITIONALLY stable for any L, R, C, L_c the optimiser
+        chooses.  No clamp needed.  (Same diagonal-SSM kernel family as S4D.)
+
+        With a pole bank, L,R,C,L_c are [d, P]; the kernel is computed for every
+        (channel, pole), then mixed down to one kernel per channel by `pole_mix`.
+
+        Always computed in float32 — FFT requires float32, not float16.
         """
-        # Compute in float32 regardless of model dtype (FFT needs float32)
         L  = self.L.float();  R  = self.R.float()
         C  = self.C.float();  Lc = self.L_c.float()
         dt = float(self.dt)
 
-        alpha_i = 1.0 - R  * dt / L
-        alpha_q = dt * (-1.0 / (L * C) + 1.0 / (L * Lc))
-        gamma   = dt / L
-        beta_q  = 1.0 + alpha_q * dt
-        beta_i  = alpha_i * dt
-        delta   = gamma * dt
+        omega2 = (1.0 / C + 1.0 / Lc) / L          # [d,P]  effective stiffness > 0
+        gamma  = R / (2.0 * L)                      # [d,P]  decay rate > 0
 
-        return _impulse_loop(beta_q, beta_i, alpha_q, alpha_i,
-                             delta, gamma, T)   # [T, d_inner] float32
+        disc = (gamma * gamma - omega2).to(torch.complex64)   # [d,P]
+        sq   = torch.sqrt(disc)                                # [d,P] complex
+        g    = (-gamma).to(torch.complex64)                    # [d,P]
+        s1, s2 = g + sq, g - sq                                # roots [d,P]
+
+        n = torch.arange(T, device=L.device, dtype=torch.float32)
+        t = (n * dt).to(torch.complex64).view(T, 1, 1)         # [T,1,1]
+
+        e1  = torch.exp(s1.unsqueeze(0) * t)                   # [T,d,P]
+        e2  = torch.exp(s2.unsqueeze(0) * t)                   # [T,d,P]
+        den = (s1 - s2).unsqueeze(0)                           # [1,d,P]
+
+        # Critical-damping limit (s1≈s2): (e^{s1 t}−e^{s2 t})/(s1−s2) → t·e^{s1 t}
+        eps   = 1e-5
+        near  = den.abs() < eps
+        h_gen = (e1 - e2) / torch.where(near, den + eps, den)
+        h_crit = t * e1
+        h = torch.where(near, h_crit, h_gen).real                # [T,d,P]
+
+        h = h * (dt / L.unsqueeze(0))            # scale by (1/L)·dt (∼ discrete sum)
+        h = (h * self.pole_mix.unsqueeze(0)).sum(dim=-1)   # mix bank → [T, d_inner]
+        return h.to(torch.float32)
 
     # ── Forward (FFT parallel scan) ───────────────────────────────────────────
 
@@ -194,7 +247,8 @@ class CoupledOscillatorMixer(nn.Module):
                  = IFFT(FFT(h) × FFT(V))   [O(T log T), fully parallel]
         """
         B, T, _ = x.shape
-        V = self.proj_in(x)          # [B, T, d_inner]
+        V    = self.proj_in(x)               # [B, T, d_inner]  content
+        gate = F.silu(self.proj_gate(x))     # [B, T, d_inner]  selective gate
 
         h  = self._impulse_response(T)        # [T, d_inner]  float32
 
@@ -207,15 +261,21 @@ class CoupledOscillatorMixer(nn.Module):
                                 n=n, dim=1)[:, :T] # [B, T, d_inner]  float32
         Y     = Y.to(V.dtype)                      # cast back (fp16 if AMP)
 
-        y = self.norm(Y)
+        # ── Selective gating: SSM output modulated by content-dependent gate ──
+        y = self.norm(Y) * gate
         return self.proj_out(y)
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def wave_stats(self) -> dict:
+        # Spread of natural frequencies WITHIN the pole bank (per channel, then
+        # averaged) — the real diversity metric now that poles live per-channel.
+        omega_bank_spread = self.omega_0.std(dim=-1).mean().item() \
+            if self.n_poles > 1 else 0.0
         return {
             "omega_0_mean":    self.omega_0.mean().item(),
+            "omega_0_spread":  omega_bank_spread,
             "damping_mean":    self.damping_ratio.mean().item(),
             "wave_speed_mean": self.wave_speed.mean().item(),
             "coupling_mean":   (1.0 / self.L_c).mean().item(),
@@ -224,7 +284,7 @@ class CoupledOscillatorMixer(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"d_inner={self.d_inner}, dt={self.dt}, "
+            f"d_inner={self.d_inner}, n_poles={self.n_poles}, dt={self.dt}, "
             f"ω₀≈{self.omega_0.mean():.3f}, "
             f"wave_speed≈{self.wave_speed.mean():.3f}"
         )

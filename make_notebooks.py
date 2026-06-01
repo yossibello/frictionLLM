@@ -3,6 +3,9 @@ make_notebooks.py — generate JupyterHub and Kaggle notebooks from source.
 
 Reads the actual friction_llm/*.py files so the notebooks always stay in sync.
 Run:  python make_notebooks.py
+
+Focus: PhysicsLM (selective multi-pole SSM, no attention) head-to-head against a
+standard GPT-2-style transformer baseline — same params budget, same data, same steps.
 """
 
 import json
@@ -46,17 +49,25 @@ def write_nb(nb, path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 TITLE_MD = """\
-# RLCFrictionLM — Deep Training Run
-### Full L+R+C circuit neurons: watching physics emerge across layers
+# PhysicsLM vs GPT-2 — Head-to-Head
+### Selective multi-pole SSM (no attention) vs a standard transformer
 
-Each neuron is a damped harmonic oscillator with **learned** inductance (L),
-resistance (R), and capacitance (C). Starting from identical critical damping,
-the network freely discovers which layers should resonate and which should stabilise.
+**PhysicsLM** replaces attention with a `CoupledOscillatorMixer`: each channel is a
+bank of damped RLC resonators (a diagonal state-space model, S4D family) convolved
+causally along the sequence — **O(T·logT)**, not O(T²) — with a Mamba-style
+content gate for selectivity. The FFN is an RLC circuit neuron with a friction gate
+(sparse at inference).
+
+**GPT-2 baseline** is the control: same depth, same width, dot-product attention +
+GELU FFN. Identical data, steps, and optimiser. PhysicsLM must beat this on
+validation loss to justify the architecture.
 
 **What to watch during training:**
-- `ω₀ spread` — natural frequencies diverging across layers (starts at 0, grows)
-- `underdamped layers` — how many layers went resonant (ζ < 1)
-- `sparsity` — fraction of neurons silent (target: 70%+ for CPU advantage)
+- `val` — the number that matters. Lower wins.
+- `bank ω₀` — spread of resonant frequencies *within* each channel's pole bank
+  (starts ~3.3 thanks to the spread init; the old single-pole model started at 0).
+- `underdamped` — layers/poles that went resonant (ζ < 1).
+- `sparse` — fraction of FFN neurons silent (CPU-inference advantage; target 70%+).
 """
 
 SETUP_CELL = """\
@@ -66,7 +77,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Fixed seed — both models see batches sampled from same distribution
+# Fixed seed — both models see batches sampled from the same distribution
 SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -115,20 +126,33 @@ os.chdir(REPO)
 print("Working dir:", os.getcwd())
 """
 
-IMPORT_CELL = """\
-from friction_llm import (
-    FrictionConfig, RLCFrictionLM, BaselineLM,
-    SharpnessCurriculum, RLCNeuron
+CKPT_FINDER_CELL = """\
+import subprocess, os
+result = subprocess.run(
+    ['find', '/kaggle/working', '-name', '*.pt', '-not', '-path', '*/.git/*'],
+    capture_output=True, text=True
 )
+files = sorted(result.stdout.strip().split('\\n'))
+if files and files[0]:
+    print('Found checkpoints:')
+    for f in files:
+        print(f'  {f}  ({os.path.getsize(f)/1e6:.0f} MB)')
+else:
+    print('No checkpoints found yet.')
+"""
+
+IMPORT_CELL = """\
+from friction_llm import FrictionConfig, PhysicsLM, BaselineLM, SharpnessCurriculum
+
 cfg_test = FrictionConfig.tiny()
 cfg_test.use_rlc = True
-m_rlc  = RLCFrictionLM(cfg_test)
+cfg_test.use_coupled_mixer = True
+m_phy  = PhysicsLM(cfg_test)
 m_base = BaselineLM(cfg_test)
-print(f"Import OK")
-print(f"  RLCFrictionLM (tiny): {m_rlc.param_count()/1e6:.2f}M params")
-print(f"  BaselineLM    (tiny): {m_base.param_count()/1e6:.2f}M params")
-print(f"  Param difference    : {(m_rlc.param_count()-m_base.param_count())/1e3:.1f}K  (L,R,C overhead)")
-del m_rlc, m_base, cfg_test
+print("Import OK")
+print(f"  PhysicsLM  (tiny): {m_phy.param_count()/1e6:.2f}M params  (no attention)")
+print(f"  BaselineLM (tiny): {m_base.param_count()/1e6:.2f}M params  (GPT-2 style)")
+del m_phy, m_base, cfg_test
 """
 
 DATA_CELL = """\
@@ -197,49 +221,38 @@ print(f"Val     : {len(val_ds):,} positions")
 """
 
 TRAIN_FUNC_CELL = """\
-from friction_llm import FrictionConfig, RLCFrictionLM, BaselineLM, SharpnessCurriculum
+from friction_llm import FrictionConfig, PhysicsLM, BaselineLM, SharpnessCurriculum
 
 def unwrap(model):
     return model.module if isinstance(model, nn.DataParallel) else model
 
 def circuit_snapshot(base):
-    \"\"\"Per-layer ω₀, ζ, underdamped %, sparsity — for live monitoring.\"\"\"
+    \"\"\"Per-layer ω₀, ζ, underdamped %, within-bank ω₀ spread, sparsity.\"\"\"
     rows = []
     for block in base.blocks:
-        # RLCTransformerBlock → rlc_block
-        # PhysicsBlock        → filter (RLCFrictionBlock) and mixer (CoupledOscillatorMixer)
-        # BaselineBlock       → nothing
-        rlc_block = getattr(block, "rlc_block", None) or getattr(block, "filter", None)
-        # For PhysicsLM, prefer the mixer's wave stats for ω₀/ζ
-        mixer = getattr(block, "mixer", None)
-        if mixer is not None and hasattr(mixer, "omega_0"):
-            # PhysicsLM: ω₀ from the wave mixer
+        # PhysicsBlock → mixer (CoupledOscillatorMixer) + filter (RLCFrictionBlock)
+        # BaselineBlock → neither
+        mixer     = getattr(block, "mixer", None)
+        rlc_block = getattr(block, "filter", None) or getattr(block, "rlc_block", None)
+        if mixer is not None and hasattr(mixer, "wave_stats"):
+            ws   = mixer.wave_stats()
             fric = getattr(rlc_block, "friction", None) if rlc_block else None
             rows.append({
-                "omega_0": mixer.omega_0.mean().item(),
-                "zeta":    mixer.damping_ratio.mean().item(),
-                "underdamped_pct": (mixer.damping_ratio < 1.0).float().mean().item() * 100,
-                "mu_s":    fric.mu_s.mean().item() if fric else 0.0,
-            })
-        elif rlc_block is not None and hasattr(rlc_block, "rlc"):
-            # RLCFrictionLM: ω₀ from the RLC FFN neuron
-            rlc  = rlc_block.rlc
-            fric = rlc_block.friction
-            rows.append({
-                "omega_0": rlc.omega_0.mean().item(),
-                "zeta":    rlc.damping_ratio.mean().item(),
-                "underdamped_pct": (rlc.damping_ratio < 1.0).float().mean().item() * 100,
-                "mu_s":    fric.mu_s.mean().item(),
+                "omega_0":           ws["omega_0_mean"],
+                "omega_bank_spread": ws.get("omega_0_spread", 0.0),
+                "zeta":              ws["damping_mean"],
+                "underdamped_pct":   ws["underdamped_%"],
+                "mu_s":              fric.mu_s.mean().item() if fric else 0.0,
             })
         else:
-            rows.append({"omega_0": 1.0, "zeta": 1.0,
-                         "underdamped_pct": 0.0, "mu_s": 0.0})
+            rows.append({"omega_0": 1.0, "omega_bank_spread": 0.0,
+                         "zeta": 1.0, "underdamped_pct": 0.0, "mu_s": 0.0})
     return rows
 
-def train_rlc(model, train_ds, val_ds,
-              max_steps=10000, batch_size=16,
-              lr=3e-4, log_every=100,
-              ckpt_every=1000, ckpt_dir="checkpoints"):
+def train_model(model, train_ds, val_ds,
+                max_steps=10000, batch_size=8,
+                lr=3e-4, log_every=100,
+                ckpt_every=1000, ckpt_dir="checkpoints"):
 
     # Always save outside the repo so checkpoints survive git operations
     if not os.path.isabs(ckpt_dir):
@@ -256,9 +269,10 @@ def train_rlc(model, train_ds, val_ds,
 
     base = unwrap(model)
 
+    # Physics params (incl. pole_mix) are NOT weight-decayed
     physics, other = [], []
     for n, p in base.named_parameters():
-        if any(k in n for k in ("raw_mu","raw_ratio","log_L","log_R","log_C")):
+        if any(k in n for k in ("raw_mu","raw_ratio","log_L","log_R","log_C","pole_mix")):
             physics.append(p)
         else:
             other.append(p)
@@ -273,9 +287,8 @@ def train_rlc(model, train_ds, val_ds,
 
     history = {
         "step": [], "loss": [], "val_loss": [], "sparsity": [],
-        "omega_spread": [], "zeta_spread": [],
-        "underdamped_layers": [], "sharpness": [],
-        "layers": [],
+        "omega_spread": [], "omega_bank_spread": [],
+        "underdamped_layers": [], "sharpness": [], "layers": [],
     }
     best_val_loss = float("inf")
     lr_min = lr / 10
@@ -316,7 +329,6 @@ def train_rlc(model, train_ds, val_ds,
                 if vloss.dim() > 0:
                     vloss = vloss.mean()
 
-            # Sparsity + circuit snapshot (skip for models without RLC)
             sample, _ = val_ds.get_batch(4, device)
             if hasattr(base, "circuit_report"):
                 report   = base.circuit_report(sample)
@@ -324,14 +336,15 @@ def train_rlc(model, train_ds, val_ds,
                 snap     = circuit_snapshot(base)
             else:
                 sparsity = 0.0   # baseline has no friction gate
-                snap     = [{"omega_0": 1.0, "zeta": 1.0}
+                snap     = [{"omega_0": 1.0, "zeta": 1.0,
+                             "omega_bank_spread": 0.0, "underdamped_pct": 0.0}
                             for _ in range(base.config.n_layers)]
             model.train()
 
-            omegas = [r["omega_0"] for r in snap]
-            zetas  = [r["zeta"]    for r in snap]
+            omegas      = [r["omega_0"] for r in snap]
+            zetas       = [r["zeta"]    for r in snap]
             omega_spread = max(omegas) - min(omegas)
-            zeta_spread  = max(zetas)  - min(zetas)
+            bank_spread  = float(np.mean([r.get("omega_bank_spread", 0.0) for r in snap]))
             underdamped  = sum(1 for z in zetas if z < 1.0)
 
             dt = (time.time() - t0) / max(step, 1)
@@ -340,7 +353,7 @@ def train_rlc(model, train_ds, val_ds,
             history["val_loss"].append(vloss.item())
             history["sparsity"].append(sparsity)
             history["omega_spread"].append(omega_spread)
-            history["zeta_spread"].append(zeta_spread)
+            history["omega_bank_spread"].append(bank_spread)
             history["underdamped_layers"].append(underdamped)
             history["sharpness"].append(sharpness)
             history["layers"].append(snap)
@@ -361,197 +374,241 @@ def train_rlc(model, train_ds, val_ds,
             print(
                 f"step {step:5d} | loss {loss.item():.4f} | val {vloss.item():.4f} "
                 f"{'★' if is_best else ' '}"
-                f"| sparse {sparsity:.1%} | ω₀spread {omega_spread:.4f} "
+                f"| sparse {sparsity:.1%} | bank ω₀ {bank_spread:.2f} "
                 f"| underdamped {underdamped}/{len(snap)} "
                 f"| sharp {sharpness:.1f} | {dt*1000:.0f}ms/step"
             )
 
-        # ── Checkpoint ───────────────────────────────────────────────────────
-        # Periodic: model weights only (~470 MB). best.pt keeps full state for resuming.
+        # ── Checkpoint (weights only, ~470 MB) ─────────────────────────────────
         if step % ckpt_every == 0 and step > 0:
-            path = f"{ckpt_dir}/rlc_step_{step:06d}.pt"
-            torch.save({
-                "model":  base.state_dict(),   # weights only — no optimizer, no history
-                "config": base.config,
-                "step":   step,
-            }, path)
-            print(f"  → saved {path}  (model only, ~470 MB)")
+            path = f"{ckpt_dir}/step_{step:06d}.pt"
+            torch.save({"model": base.state_dict(),
+                        "config": base.config, "step": step}, path)
+            print(f"  → saved {path}  (model only)")
 
     return history, base
 """
 
-RLC_TRAIN_CELL = """\
-# Medium config: 117M params, 12 layers — right size for WikiText-103
-cfg = FrictionConfig.medium()
-cfg.max_seq_len     = SEQ_LEN
-cfg.use_rlc         = True
-cfg.mu_s_init       = 0.05        # charge scale is ~dt²×V, much smaller than raw signal
-cfg.rlc_dt          = 0.3         # larger step → more charge per layer
-cfg.rlc_filter_mode = "learnable" # each neuron learns its own LP/BP/HP mix
-                                   # change to "lowpass" to reproduce original behaviour
+BASELINE_TRAIN_CELL = """\
+# ── GPT-2 baseline (control) ─────────────────────────────────────────────────
+cfg_b = FrictionConfig.medium()
+cfg_b.max_seq_len = SEQ_LEN
+baseline = BaselineLM(cfg_b).to(device)
+print(f"BaselineLM (GPT-2 style): {baseline.param_count()/1e6:.1f}M params")
+print(f"  {cfg_b.n_layers} layers · d_model {cfg_b.d_model} · {cfg_b.n_heads} heads · GELU FFN")
 
-model = RLCFrictionLM(cfg).to(device)
-print(f"RLCFrictionLM  : {model.param_count()/1e6:.1f}M params")
-print(f"Layers         : {cfg.n_layers}  d_model: {cfg.d_model}")
-print(f"Filter mode    : {cfg.rlc_filter_mode}")
-print(f"μ_s={cfg.mu_s_init}  rlc_dt={cfg.rlc_dt}")
-print()
-print("Watch: ω₀ spread, underdamped layers, AND filter weights evolving per layer")
-
-history, model = train_rlc(
-    model, train_ds, val_ds,
-    max_steps=10000,
-    batch_size=8,
-    lr=3e-4,
-    log_every=100,
-    ckpt_every=1000,
+history_base, baseline = train_model(
+    baseline, train_ds, val_ds,
+    max_steps=10000, batch_size=8, lr=3e-4,
+    log_every=100, ckpt_every=1000, ckpt_dir="checkpoints/baseline",
 )
 """
 
-CIRCUIT_REPORT_CELL = """\
+PHYSICS_TRAIN_CELL = """\
+# ── PhysicsLM (selective multi-pole SSM, no attention) ───────────────────────
+cfg_p = FrictionConfig.medium()
+cfg_p.max_seq_len       = SEQ_LEN
+cfg_p.use_rlc           = True
+cfg_p.use_coupled_mixer = True
+cfg_p.mu_s_init         = 0.05        # charge scale is small → low friction threshold
+cfg_p.rlc_dt            = 0.3         # integration / kernel sampling step
+cfg_p.rlc_filter_mode   = 'learnable' # each FFN neuron learns its own LP/BP/HP mix
+cfg_p.mixer_L_c_init    = 5.0         # coupling inductance (adds restoring stiffness)
+cfg_p.mixer_n_poles     = 8           # resonators per channel (S4D-style bank)
+
+physics_model = PhysicsLM(cfg_p).to(device)
+print(f"PhysicsLM      : {physics_model.param_count()/1e6:.1f}M params  (no attention, O(T·logT))")
+print(f"  {cfg_p.n_layers} layers · d_model {cfg_p.d_model} · {cfg_p.mixer_n_poles} poles/channel + selective gate")
+print(f"  vs baseline {baseline.param_count()/1e6:.1f}M  (PhysicsLM's gate branch adds the delta)")
+
+history_phy, physics_model = train_model(
+    physics_model, train_ds, val_ds,
+    max_steps=10000, batch_size=8, lr=3e-4,
+    log_every=100, ckpt_every=1000,
+    ckpt_dir='/kaggle/working/checkpoints/physics',
+)
+"""
+
+COMPARE_CELL = """\
+import matplotlib.pyplot as plt
+
+runs = [
+    ('GPT-2 baseline', history_base, 'gray'),
+    ('PhysicsLM (no attn)', history_phy, 'darkorange'),
+]
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 4.5))
+fig.suptitle('PhysicsLM vs GPT-2  —  same params budget, same data, same steps',
+             fontweight='bold')
+
+ax = axes[0]
+for label, hist, c in runs:
+    ax.plot(hist['step'], hist['val_loss'], label=label, color=c, lw=2)
+ax.set(xlabel='Step', ylabel='Val Loss', title='Validation Loss  ← lower wins')
+ax.legend(); ax.grid(alpha=0.3)
+
+ax = axes[1]
+for label, hist, c in runs:
+    ax.plot(hist['step'], hist['loss'], label=label, color=c, alpha=0.7, lw=1.5)
+ax.set(xlabel='Step', ylabel='Train Loss', title='Training Loss')
+ax.legend(); ax.grid(alpha=0.3)
+
+ax = axes[2]
+ax.plot(history_phy['step'], [s*100 for s in history_phy['sparsity']],
+        color='darkorange', lw=2, label='PhysicsLM FFN')
+ax.axhline(0, color='gray', lw=2, label='GPT-2 (dense, 0%)')
+ax.axhline(70, color='green', lw=1, ls='--', label='CPU target')
+ax.set(xlabel='Step', ylabel='Sparsity %', title='FFN Gate Sparsity', ylim=[-5, 105])
+ax.legend(); ax.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('physics_vs_gpt2.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print('\\n── Final / best validation loss ─────────────────')
+for label, hist, _ in runs:
+    final = hist['val_loss'][-1]
+    best  = min(hist['val_loss'])
+    print(f'  {label:<22} final {final:.4f}   best {best:.4f}   ppl {math.exp(best):.1f}')
+winner = min(runs, key=lambda r: min(r[1]['val_loss']))[0]
+print(f'\\n  WINNER (best val): {winner}')
+print(f'  PhysicsLM FFN sparsity: {history_phy[\"sparsity\"][-1]:.1%}')
+"""
+
+WAVE_REPORT_CELL = """\
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
-
-sample_ids = torch.tensor(
+sample = torch.tensor(
     enc.encode_ordinary("The relationship between"),
     dtype=torch.long, device=device
 ).unsqueeze(0)
 
-model.eval()
-model.print_circuit_report(sample_ids)
+physics_model.eval()
+physics_model.print_wave_report(sample)
+"""
+
+FILTER_WEIGHTS_CELL = """\
+import matplotlib.pyplot as plt
+import numpy as np
+
+physics_model.eval()
+sample, _ = val_ds.get_batch(4, device)
+report = physics_model.circuit_report(sample)
+
+n_layers = physics_model.config.n_layers
+lp, bp, hp = [], [], []
+for i in range(n_layers):
+    fw = report[f'layer_{i}'].get('filter_weights', {})
+    lp.append(fw.get('lowpass',  0))
+    bp.append(fw.get('bandpass', 0))
+    hp.append(fw.get('highpass', 0))
+
+x = np.arange(n_layers)
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.bar(x, lp, label='Low-pass  (slow/global)', color='#4878cf')
+ax.bar(x, bp, bottom=lp, label='Band-pass (resonant)', color='#6acc65')
+ax.bar(x, hp, bottom=[l+b for l,b in zip(lp,bp)],
+       label='High-pass (fast/local)', color='#d65f5f')
+ax.set(xlabel='Layer', ylabel='Filter weight %', ylim=[0,100],
+       title='Learned FFN filter type per layer  (emerged from training)',
+       xticks=x, xticklabels=[f'L{i}' for i in range(n_layers)])
+ax.legend(); ax.grid(alpha=0.3, axis='y')
+plt.tight_layout()
+plt.savefig('filter_weights.png', dpi=150, bbox_inches='tight')
+plt.show()
 """
 
 PHYSICS_PLOT_CELL = """\
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-steps = history["step"]
-n_layers = len(history["layers"][0]) if history["layers"] else 0
+h = history_phy
+steps = h["step"]
+n_layers = len(h["layers"][0]) if h["layers"] else 0
 
-fig = plt.figure(figsize=(18, 12))
-fig.suptitle("RLCFrictionLM — Circuit Physics Emerging During Training",
-             fontsize=14, fontweight="bold")
-gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35)
+fig = plt.figure(figsize=(18, 8))
+fig.suptitle("PhysicsLM — physics emerging during training", fontweight="bold")
+gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
 
-# ── Loss ─────────────────────────────────────────────────────────────────────
 ax = fig.add_subplot(gs[0, :2])
-ax.plot(steps, history["loss"],     label="train", alpha=0.7, linewidth=1.5)
-ax.plot(steps, history["val_loss"], label="val",   linewidth=2)
-ax.set(xlabel="Step", ylabel="Loss", title="Training & Validation Loss")
-ax.legend(); ax.grid(alpha=0.3)
+ax.plot(steps, h["loss"], label="train", alpha=0.7, lw=1.5)
+ax.plot(steps, h["val_loss"], label="val", lw=2)
+ax.set(xlabel="Step", ylabel="Loss", title="Loss"); ax.legend(); ax.grid(alpha=0.3)
 
-# ── Sparsity ─────────────────────────────────────────────────────────────────
 ax2 = fig.add_subplot(gs[0, 2])
-ax2.plot(steps, [s*100 for s in history["sparsity"]], color="steelblue", linewidth=2)
-ax2.axhline(70, linestyle="--", color="gray", alpha=0.5, label="CPU target (70%)")
-ax2.set(xlabel="Step", ylabel="Sparsity %", title="Gate Sparsity Over Training")
+ax2.plot(steps, [s*100 for s in h["sparsity"]], color="steelblue", lw=2)
+ax2.axhline(70, ls="--", color="gray", alpha=0.5, label="CPU target")
+ax2.set(xlabel="Step", ylabel="Sparsity %", title="FFN Gate Sparsity")
 ax2.legend(); ax2.grid(alpha=0.3)
 
-# ── ω₀ spread (key metric: are layers finding different frequencies?) ─────────
 ax3 = fig.add_subplot(gs[1, :2])
-ax3.plot(steps, history["omega_spread"], color="darkorange", linewidth=2)
-ax3.set(xlabel="Step", ylabel="max(ω₀) − min(ω₀)",
-        title="ω₀ Spread Across Layers  (0 = all same,  > 0 = differentiated)")
+ax3.plot(steps, h["omega_bank_spread"], color="darkorange", lw=2)
+ax3.set(xlabel="Step", ylabel="mean std(ω₀) within bank",
+        title="Within-channel pole-frequency spread  (diversity of resonators)")
 ax3.grid(alpha=0.3)
 
-# ── Underdamped layer count ───────────────────────────────────────────────────
 ax4 = fig.add_subplot(gs[1, 2])
-ax4.plot(steps, history["underdamped_layers"], color="crimson", linewidth=2,
-         drawstyle="steps-post")
+ax4.plot(steps, h["underdamped_layers"], color="crimson", lw=2, drawstyle="steps-post")
 ax4.set(xlabel="Step", ylabel="Layers with ζ < 1",
-        title=f"Resonant Layers  (out of {n_layers})")
+        title=f"Resonant layers (of {n_layers})")
 ax4.set_yticks(range(n_layers + 1)); ax4.grid(alpha=0.3)
 
-# ── Per-layer ω₀ evolution (heatmap over training) ───────────────────────────
-ax5 = fig.add_subplot(gs[2, :2])
-if history["layers"] and n_layers > 0:
-    omega_matrix = np.array([[r["omega_0"] for r in snap]
-                              for snap in history["layers"]]).T   # [n_layers, steps]
-    im = ax5.imshow(omega_matrix, aspect="auto", cmap="RdYlGn",
-                    extent=[steps[0], steps[-1], n_layers-0.5, -0.5])
-    plt.colorbar(im, ax=ax5, label="ω₀")
-    ax5.set(xlabel="Step", ylabel="Layer", yticks=range(n_layers),
-            yticklabels=[f"L{i}" for i in range(n_layers)],
-            title="ω₀ per Layer Over Training  (green=higher freq, red=lower freq)")
-
-# ── Per-layer ζ at end of training ───────────────────────────────────────────
-ax6 = fig.add_subplot(gs[2, 2])
-if history["layers"]:
-    final_zeta = [r["zeta"] for r in history["layers"][-1]]
-    colors = ["crimson" if z < 1.0 else "steelblue" for z in final_zeta]
-    ax6.barh(range(n_layers), final_zeta, color=colors)
-    ax6.axvline(1.0, color="black", linestyle="--", linewidth=1.5, label="ζ=1 (critical)")
-    ax6.set(xlabel="Damping ratio ζ", yticks=range(n_layers),
-            yticklabels=[f"L{i}" for i in range(n_layers)],
-            title="Final zeta per Layer  (red=resonant, blue=overdamped)")
-    ax6.legend(fontsize=8); ax6.grid(alpha=0.3, axis="x")
-
-plt.savefig("rlc_physics.png", dpi=150, bbox_inches="tight")
+plt.savefig("physics_training.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Saved: rlc_physics.png")
-"""
-
-SPARSITY_CELL = """\
-sample, _ = val_ds.get_batch(8, device)
-model.eval()
-model.print_circuit_report(sample)
 """
 
 GENERATE_CELL = """\
 import tiktoken
 enc = tiktoken.get_encoding("gpt2")
 
-prompts = [
-    "The theory of",
-    "In the year 1900",
-    "Scientists discovered that",
-]
-
+prompts = ["The theory of", "In the year 1900", "Scientists discovered that"]
+physics_model.eval()
 for prompt in prompts:
     ids = enc.encode_ordinary(prompt)
     idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-    out = model.generate(idx, max_new_tokens=120, temperature=0.8, top_k=40)
+    out = physics_model.generate(idx, max_new_tokens=120, temperature=0.8, top_k=40)
     print(f"Prompt: {prompt!r}")
     print(enc.decode(out[0].tolist()))
     print("-" * 60)
 """
 
 RESUME_MD = """\
-## Resuming from checkpoint
+## Resuming PhysicsLM from checkpoint
 
-Checkpoints are saved to `/kaggle/working/checkpoints/` (absolute path, always the same place).
+Checkpoints are saved to `/kaggle/working/checkpoints/physics/` (absolute path).
 
 ```python
 import glob, torch
-# Find latest checkpoint
-ckpts = sorted(glob.glob("/kaggle/working/checkpoints/rlc_step_*.pt"))
+from friction_llm import PhysicsLM
+
+ckpts = sorted(glob.glob("/kaggle/working/checkpoints/physics/step_*.pt"))
 print("Available:", ckpts)
 
-ckpt  = torch.load(ckpts[-1], map_location=device)  # load latest
+ckpt  = torch.load(ckpts[-1], map_location=device)
 cfg   = ckpt["config"]
-model = RLCFrictionLM(cfg).to(device)
-model.load_state_dict(ckpt["model"])
-history = ckpt["history"]
-print(f"Resumed from step {ckpt['step']}, last val loss {history['val_loss'][-1]:.4f}")
+physics_model = PhysicsLM(cfg).to(device)
+physics_model.load_state_dict(ckpt["model"])
+print(f"Resumed from step {ckpt['step']}")
 
-# Continue training from where it left off
-history, model = train_rlc(
-    model, train_ds, val_ds,
-    max_steps=10000,   # will pick up from ckpt["step"] internally
-    batch_size=8, lr=3e-4,
-    ckpt_dir="/kaggle/working/checkpoints",
+# NOTE: the mixer architecture changed (analytic kernel + multi-pole bank +
+# selective gate). Checkpoints from the OLD single-pole PhysicsLM are NOT
+# compatible — start a fresh run for the upgraded model.
+
+history_phy, physics_model = train_model(
+    physics_model, train_ds, val_ds,
+    max_steps=10000, batch_size=8, lr=3e-4,
+    ckpt_dir="/kaggle/working/checkpoints/physics",
 )
 ```
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build Kaggle notebook — RLC deep training
+# Build Kaggle notebook — PhysicsLM vs GPT-2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_kaggle():
     cells = []
-
     cells.append(md(TITLE_MD))
 
     cells.append(md("## 1 · Clone repo & install"))
@@ -560,23 +617,8 @@ def build_kaggle():
     cells.append(md("## 2 · GPU setup"))
     cells.append(code(SETUP_CELL))
 
-    cells.append(md("## Find existing checkpoints (run this if resuming)"))
-    cells.append(code(
-        "import subprocess\n"
-        "result = subprocess.run(\n"
-        "    ['find', '/kaggle/working', '-name', '*.pt', '-not', '-path', '*/.git/*'],\n"
-        "    capture_output=True, text=True\n"
-        ")\n"
-        "files = sorted(result.stdout.strip().split('\\n'))\n"
-        "if files and files[0]:\n"
-        "    print('Found checkpoints:')\n"
-        "    for f in files:\n"
-        "        import os\n"
-        "        size = os.path.getsize(f) / 1e6\n"
-        "        print(f'  {f}  ({size:.0f} MB)')\n"
-        "else:\n"
-        "    print('No checkpoints found yet.')\n"
-    ))
+    cells.append(md("## Find existing checkpoints (run if resuming)"))
+    cells.append(code(CKPT_FINDER_CELL))
 
     cells.append(md("## 3 · Verify imports"))
     cells.append(code(IMPORT_CELL))
@@ -586,235 +628,66 @@ def build_kaggle():
     cells.append(code(TOKENIZE_CELL))
     cells.append(code(DATALOADER_CELL))
 
-    cells.append(md("## 5 · Training function\n\nLogs ω₀ spread and underdamped layer count every step — watch the physics emerge."))
+    cells.append(md("## 5 · Training function\n\nShared loop for both models. Logs val loss, "
+                    "within-bank ω₀ spread, resonant layers, and FFN sparsity every `log_every` steps."))
     cells.append(code(TRAIN_FUNC_CELL))
 
-    cells.append(md(
-        "## 6 · Train — Baseline GPT-2 (control experiment)\n\n"
-        "Standard transformer: same size, same data, same steps — **no physics**.\n"
-        "This is the control. RLC must beat this to prove the architecture works."
-    ))
-    cells.append(code(
-        "cfg_b = FrictionConfig.medium()\n"
-        "cfg_b.max_seq_len = SEQ_LEN\n"
-        "baseline = BaselineLM(cfg_b).to(device)\n"
-        "print(f'BaselineLM: {baseline.param_count()/1e6:.1f}M params  (standard GELU FFN)')\n"
-        "\n"
-        "# Reuse train_rlc — baseline has no RLC state, circuit_report returns None\n"
-        "# so sparsity defaults to 0 and circuit cols are skipped automatically\n"
-        "history_base, baseline = train_rlc(\n"
-        "    baseline, train_ds, val_ds,\n"
-        "    max_steps=10000, batch_size=8, lr=3e-4,\n"
-        "    log_every=100, ckpt_every=1000, ckpt_dir='checkpoints/baseline',\n"
-        ")\n"
-    ))
+    cells.append(md("## 6 · Train — GPT-2 baseline (control)\n\n"
+                    "Standard transformer: same depth/width, dot-product attention + GELU FFN. "
+                    "PhysicsLM must beat this val loss to justify the architecture."))
+    cells.append(code(BASELINE_TRAIN_CELL))
 
-    cells.append(md(
-        "## 7 · RLCFrictionLM results — previous session\n\n"
-        "Already trained: 10 000 steps, WikiText-103, lowpass filter mode.\n"
-        "Best val loss: **4.1686** at step 9700.\n"
-        "Inject the history from actual training logs for the comparison plot."
-    ))
-    cells.append(code(
-        "import numpy as np\n"
-        "\n"
-        "# RLC results from previous Kaggle session (10k steps, WikiText-103)\n"
-        "# Val loss approximated from actual training logs shared during the run\n"
-        "_steps = list(range(0, 10001, 100))\n"
-        "_rlc_val = (\n"
-        "    [10.85, 9.8, 9.0, 8.3, 7.6, 7.0, 6.5, 6.1, 5.8, 5.6,\n"
-        "     5.4, 5.3, 5.2, 5.1, 5.0, 5.0, 4.9, 4.9, 4.8, 4.8,\n"
-        "     4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8, 4.8,\n"
-        "     4.8, 4.8, 4.8, 4.7, 4.9, 5.0, 4.8, 4.8, 4.8, 4.8,\n"
-        "     5.0, 4.9, 4.9, 4.7, 5.0, 5.0, 5.0, 5.2, 4.7, 4.8,\n"
-        "     4.8, 4.8, 4.8, 4.7, 4.8, 4.8, 4.7, 4.8, 4.7, 4.8,\n"
-        "     4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7,\n"
-        "     4.6, 4.6, 4.5, 4.6, 4.5, 4.3, 4.7, 4.5, 4.5, 4.5,\n"
-        "     4.5, 4.3, 4.8, 4.5, 4.6, 4.3, 4.7, 4.6, 4.7, 4.7,\n"
-        "     4.8, 4.2, 4.3, 4.2, 4.5, 4.3, 4.3, 4.2, 4.7, 4.5, 4.47\n"
-        "    ]\n"
-        ")\n"
-        "\n"
-        "history = {\n"
-        "    'step':               _steps,\n"
-        "    'val_loss':           _rlc_val,\n"
-        "    'loss':               [10.85] + [4.6] * 100,\n"
-        "    'sparsity':           [0.0]*11 + [0.49]*40 + [0.53]*50,\n"
-        "    'omega_spread':       [0.0]*10 + list(np.linspace(0, 0.112, 91)),\n"
-        "    'underdamped_layers': [0]*30 + [2]*20 + [3]*20 + [4]*31,\n"
-        "    'sharpness':          list(np.linspace(3, 50, 101)),\n"
-        "    'layers':             [],\n"
-        "}\n"
-        "model = None  # checkpoint loaded separately if needed\n"
-        "print(f'RLC history injected: {len(_steps)} steps')\n"
-        "print(f'Best val loss : {min(_rlc_val):.4f} (step 9700)')\n"
-        "print(f'Final sparsity: 53%   omega spread: 0.112')\n"
-    ))
+    cells.append(md("## 7 · Train — PhysicsLM (no attention)\n\n"
+                    "Selective multi-pole RLC SSM replaces attention (O(T·logT)); "
+                    "RLC friction circuit replaces the FFN (sparse at inference)."))
+    cells.append(code(PHYSICS_TRAIN_CELL))
 
-    cells.append(md(
-        "## 8 · Train — PhysicsLM (no attention — pure wave propagation)\n\n"
-        "Replaces dot-product attention with a 1D RLC transmission line.\n"
-        "Information propagates as waves along the token sequence — O(T) not O(T²)."
-    ))
-    cells.append(code(
-        "from friction_llm import PhysicsLM\n"
-        "\n"
-        "cfg_p = FrictionConfig.medium()\n"
-        "cfg_p.max_seq_len      = SEQ_LEN\n"
-        "cfg_p.use_rlc          = True\n"
-        "cfg_p.use_coupled_mixer= True\n"
-        "cfg_p.mu_s_init        = 0.05\n"
-        "cfg_p.rlc_dt           = 0.3\n"
-        "cfg_p.rlc_filter_mode  = 'learnable'\n"
-        "cfg_p.mixer_L_c_init   = 5.0\n"
-        "\n"
-        "physics_model = PhysicsLM(cfg_p).to(device)\n"
-        "print(f'PhysicsLM      : {physics_model.param_count()/1e6:.1f}M params')\n"
-        "print(f'No attention   : wave propagation only  (O(T) vs O(T²))')\n"
-        "\n"
-        "history_phy, physics_model = train_rlc(\n"
-        "    physics_model, train_ds, val_ds,\n"
-        "    max_steps=10000, batch_size=8, lr=3e-4,\n"
-        "    log_every=100, ckpt_every=1000,\n"
-        "    ckpt_dir='/kaggle/working/checkpoints/physics',\n"
-        ")\n"
-    ))
+    cells.append(md("## 8 · Head-to-head: PhysicsLM vs GPT-2\n\nThe definitive test — who wins?"))
+    cells.append(code(COMPARE_CELL))
 
-    cells.append(md("## 9 · Head-to-head: Baseline vs RLC vs PhysicsLM\n\nThe definitive test — same params, same data, same steps. Who wins?"))
-    cells.append(code(
-        "import matplotlib.pyplot as plt\n"
-        "\n"
-        "fig, axes = plt.subplots(1, 3, figsize=(18, 4))\n"
-        "fig.suptitle('3-way: Baseline (GELU) vs RLCFrictionLM vs PhysicsLM (no attention)',\n"
-        "             fontweight='bold')\n"
-        "\n"
-        "COLORS = {'Baseline':'gray', 'RLC':'steelblue', 'Physics':'darkorange'}\n"
-        "runs = [\n"
-        "    ('Baseline', history_base, 'gray'),\n"
-        "    ('RLC+Friction (attn)', history,     'steelblue'),\n"
-        "    ('PhysicsLM (no attn)', history_phy, 'darkorange'),\n"
-        "]\n"
-        "\n"
-        "ax = axes[0]\n"
-        "for label, hist, c in runs:\n"
-        "    ax.plot(hist['step'], hist['val_loss'], label=label, color=c, lw=2)\n"
-        "ax.set(xlabel='Step', ylabel='Val Loss', title='Validation Loss  ← lower wins')\n"
-        "ax.legend(fontsize=8); ax.grid(alpha=0.3)\n"
-        "\n"
-        "ax = axes[1]\n"
-        "for label, hist, c in runs:\n"
-        "    ax.plot(hist['step'], hist['loss'], color=c, alpha=0.6, lw=1.5, label=label)\n"
-        "ax.set(xlabel='Step', ylabel='Train Loss', title='Training Loss')\n"
-        "ax.legend(fontsize=8); ax.grid(alpha=0.3)\n"
-        "\n"
-        "ax = axes[2]\n"
-        "ax.axhline(0, color='gray', lw=2, label='Baseline (0%)')\n"
-        "ax.plot(history['step'],     [s*100 for s in history['sparsity']],\n"
-        "        color='steelblue', lw=2, label='RLC')\n"
-        "ax.plot(history_phy['step'], [s*100 for s in history_phy['sparsity']],\n"
-        "        color='darkorange', lw=2, label='PhysicsLM')\n"
-        "ax.axhline(70, color='green', lw=1, linestyle='--', label='CPU target')\n"
-        "ax.set(xlabel='Step', ylabel='Sparsity %', title='Gate Sparsity', ylim=[-5,105])\n"
-        "ax.legend(fontsize=8); ax.grid(alpha=0.3)\n"
-        "\n"
-        "plt.tight_layout()\n"
-        "plt.savefig('3way_comparison.png', dpi=150, bbox_inches='tight')\n"
-        "plt.show()\n"
-        "\n"
-        "print('\\n── Final val loss ───────────────────────')\n"
-        "results = {label: hist['val_loss'][-1] for label, hist, _ in runs}\n"
-        "best = min(results, key=results.get)\n"
-        "for label, val in sorted(results.items(), key=lambda x: x[1]):\n"
-        "    marker = ' ← WINNER' if label == best else ''\n"
-        "    print(f'  {label:<30} {val:.4f}{marker}')\n"
-        "print(f'\\nRLC sparsity    : {history[\"sparsity\"][-1]:.1%}')\n"
-        "print(f'Physics sparsity: {history_phy[\"sparsity\"][-1]:.1%}')\n"
-    ))
-
-    cells.append(md("## 9 · Circuit physics report"))
-    cells.append(code(CIRCUIT_REPORT_CELL))
-
-    cells.append(md(
-        "## 10 · Filter weights per layer\n\n"
-        "What filter type did each layer learn? "
-        "LP=low-pass (slow/global), BP=band-pass (resonant/selective), HP=high-pass (fast/local)."
-    ))
-    cells.append(code(
-        "model.eval()\n"
-        "sample, _ = val_ds.get_batch(4, device)\n"
-        "report = model.circuit_report(sample)\n"
-        "\n"
-        "import matplotlib.pyplot as plt\n"
-        "import numpy as np\n"
-        "\n"
-        "n_layers = model.config.n_layers\n"
-        "lp, bp, hp = [], [], []\n"
-        "for i in range(n_layers):\n"
-        "    fw = report[f'layer_{i}']['filter_weights']\n"
-        "    lp.append(fw.get('lowpass',  0))\n"
-        "    bp.append(fw.get('bandpass', 0))\n"
-        "    hp.append(fw.get('highpass', 0))\n"
-        "\n"
-        "x = np.arange(n_layers)\n"
-        "fig, ax = plt.subplots(figsize=(12, 4))\n"
-        "ax.bar(x, lp, label='Low-pass  (slow/global)',      color='#4878cf')\n"
-        "ax.bar(x, bp, bottom=lp, label='Band-pass (resonant)',  color='#6acc65')\n"
-        "ax.bar(x, hp, bottom=[l+b for l,b in zip(lp,bp)],\n"
-        "       label='High-pass (fast/local)', color='#d65f5f')\n"
-        "ax.set(xlabel='Layer', ylabel='Filter weight %', ylim=[0,100],\n"
-        "       title='Learned Filter Type per Layer  (emerged from training)',\n"
-        "       xticks=x, xticklabels=[f'L{i}' for i in range(n_layers)])\n"
-        "ax.legend(); ax.grid(alpha=0.3, axis='y')\n"
-        "plt.tight_layout()\n"
-        "plt.savefig('filter_weights.png', dpi=150, bbox_inches='tight')\n"
-        "plt.show()\n"
-        "\n"
-        "print('\\nFilter composition per layer:')\n"
-        "for i in range(n_layers):\n"
-        "    fw = report[f'layer_{i}']['filter_weights']\n"
-        "    dominant = max(fw, key=fw.get)\n"
-        "    print(f'  Layer {i:2d}: LP={lp[i]:5.1f}%  BP={bp[i]:5.1f}%  '\n"
-        "          f'HP={hp[i]:5.1f}%  → {dominant}')\n"
-    ))
-
-    cells.append(md("## 11 · Circuit evolution plots"))
+    cells.append(md("## 9 · PhysicsLM training dynamics"))
     cells.append(code(PHYSICS_PLOT_CELL))
 
-    cells.append(md("## 11 · Sparsity detail"))
-    cells.append(code(SPARSITY_CELL))
+    cells.append(md("## 10 · Wave / circuit report (per layer)"))
+    cells.append(code(WAVE_REPORT_CELL))
+
+    cells.append(md("## 11 · Learned FFN filter type per layer\n\n"
+                    "LP=low-pass (slow/global), BP=band-pass (resonant), HP=high-pass (fast/local)."))
+    cells.append(code(FILTER_WEIGHTS_CELL))
 
     cells.append(md("## 12 · Text generation"))
     cells.append(code(GENERATE_CELL))
 
     cells.append(md(RESUME_MD))
-
     return notebook(cells, accelerator="GPU")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Build JupyterHub notebook
+# Build JupyterHub notebook (local, single machine)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_jupyterhub():
     cells = []
     cells.append(md(TITLE_MD))
     cells.append(md("## Setup\n\nRun from repo root. Requires: `torch tiktoken datasets`"))
-    cells.append(code(
-        "import sys; sys.path.insert(0, '.')\n" + SETUP_CELL
-    ))
+    cells.append(code("import sys; sys.path.insert(0, '.')\n" + SETUP_CELL))
     cells.append(code(IMPORT_CELL))
     cells.append(md("## Data"))
     cells.append(code(DATA_CELL))
     cells.append(code(TOKENIZE_CELL))
     cells.append(code(DATALOADER_CELL))
-    cells.append(md("## Training"))
+    cells.append(md("## Training function"))
     cells.append(code(TRAIN_FUNC_CELL))
-    cells.append(md("## Train RLCFrictionLM"))
-    cells.append(code(RLC_TRAIN_CELL))
-    cells.append(md("## Circuit report"))
-    cells.append(code(CIRCUIT_REPORT_CELL))
-    cells.append(md("## Visualise"))
+    cells.append(md("## Train GPT-2 baseline"))
+    cells.append(code(BASELINE_TRAIN_CELL))
+    cells.append(md("## Train PhysicsLM"))
+    cells.append(code(PHYSICS_TRAIN_CELL))
+    cells.append(md("## Compare"))
+    cells.append(code(COMPARE_CELL))
+    cells.append(md("## PhysicsLM dynamics"))
     cells.append(code(PHYSICS_PLOT_CELL))
+    cells.append(md("## Wave report"))
+    cells.append(code(WAVE_REPORT_CELL))
     cells.append(md("## Generate"))
     cells.append(code(GENERATE_CELL))
     cells.append(md(RESUME_MD))
