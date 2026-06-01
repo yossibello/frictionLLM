@@ -221,7 +221,11 @@ def train_rlc(model, train_ds, val_ds,
               lr=3e-4, log_every=100,
               ckpt_every=1000, ckpt_dir="checkpoints"):
 
+    # Always save outside the repo so checkpoints survive git operations
+    if not os.path.isabs(ckpt_dir):
+        ckpt_dir = os.path.join("/kaggle/working", ckpt_dir)
     os.makedirs(ckpt_dir, exist_ok=True)
+    print(f"Checkpoints → {ckpt_dir}")
     use_amp = device.type == "cuda"
     scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -475,18 +479,29 @@ for prompt in prompts:
 RESUME_MD = """\
 ## Resuming from checkpoint
 
-If the Kaggle session restarted, resume from the last checkpoint:
+Checkpoints are saved to `/kaggle/working/checkpoints/` (absolute path, always the same place).
 
 ```python
-ckpt = torch.load("checkpoints/rlc_step_005000.pt", map_location=device)
-cfg  = ckpt["config"]
+import glob, torch
+# Find latest checkpoint
+ckpts = sorted(glob.glob("/kaggle/working/checkpoints/rlc_step_*.pt"))
+print("Available:", ckpts)
+
+ckpt  = torch.load(ckpts[-1], map_location=device)  # load latest
+cfg   = ckpt["config"]
 model = RLCFrictionLM(cfg).to(device)
 model.load_state_dict(ckpt["model"])
 history = ckpt["history"]
-print(f"Resumed from step {ckpt['step']}, last loss {history['loss'][-1]:.4f}")
-```
+print(f"Resumed from step {ckpt['step']}, last val loss {history['val_loss'][-1]:.4f}")
 
-Then call `train_rlc(model, ...)` with `max_steps` set to whatever you want to continue to.
+# Continue training from where it left off
+history, model = train_rlc(
+    model, train_ds, val_ds,
+    max_steps=10000,   # will pick up from ckpt["step"] internally
+    batch_size=8, lr=3e-4,
+    ckpt_dir="/kaggle/working/checkpoints",
+)
+```
 """
 
 
@@ -504,6 +519,24 @@ def build_kaggle():
 
     cells.append(md("## 2 · GPU setup"))
     cells.append(code(SETUP_CELL))
+
+    cells.append(md("## Find existing checkpoints (run this if resuming)"))
+    cells.append(code(
+        "import subprocess\n"
+        "result = subprocess.run(\n"
+        "    ['find', '/kaggle/working', '-name', '*.pt', '-not', '-path', '*/.git/*'],\n"
+        "    capture_output=True, text=True\n"
+        ")\n"
+        "files = sorted(result.stdout.strip().split('\\n'))\n"
+        "if files and files[0]:\n"
+        "    print('Found checkpoints:')\n"
+        "    for f in files:\n"
+        "        import os\n"
+        "        size = os.path.getsize(f) / 1e6\n"
+        "        print(f'  {f}  ({size:.0f} MB)')\n"
+        "else:\n"
+        "    print('No checkpoints found yet.')\n"
+    ))
 
     cells.append(md("## 3 · Verify imports"))
     cells.append(code(IMPORT_CELL))
