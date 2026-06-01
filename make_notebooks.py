@@ -88,18 +88,30 @@ if device.type == "cuda":
 CLONE_CELL = """\
 !pip install tiktoken datasets --quiet
 
-import os, subprocess, sys
+import os, subprocess, sys, shutil
 
-if not os.path.exists("frictionLLM"):
+# Always use absolute path — prevents recursive cloning on re-runs
+REPO = "/kaggle/working/frictionLLM"
+
+# ── One-time cleanup: remove any nested frictionLLM/frictionLLM recursion ──
+nested = os.path.join(REPO, "frictionLLM")
+if os.path.exists(nested):
+    print(f"Cleaning up recursive clone at {nested} ...")
+    shutil.rmtree(nested)
+    print("Done.")
+
+# ── Clone or pull ──────────────────────────────────────────────────────────
+if not os.path.exists(REPO):
     subprocess.run(["git", "clone",
-                    "https://github.com/yossibello/frictionLLM.git"], check=True)
-    print("Cloned frictionLLM")
+                    "https://github.com/yossibello/frictionLLM.git", REPO],
+                   check=True)
+    print("Cloned →", REPO)
 else:
-    subprocess.run(["git", "-C", "frictionLLM", "pull"], check=True)
-    print("Updated frictionLLM")
+    subprocess.run(["git", "-C", REPO, "pull"], check=True)
+    print("Updated →", REPO)
 
-sys.path.insert(0, "frictionLLM")
-os.chdir("frictionLLM")
+sys.path.insert(0, REPO)
+os.chdir(REPO)
 print("Working dir:", os.getcwd())
 """
 
