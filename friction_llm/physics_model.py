@@ -104,15 +104,68 @@ class PhysicsLM(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
     ) -> torch.Tensor:
+        """
+        Autoregressive generation using the recurrent SSM form — O(1) per token.
+
+        Old path: re-ran full FFT forward over the growing sequence every step
+                  → O(T² logT) total for T generated tokens.
+        New path: maintains SSM state (alpha, beta) across tokens, advancing it
+                  one step per new token → O(T) total regardless of sequence length.
+
+        RLC/momentum state is cross-layer only (matching training semantics where
+        it flows block→block within one token, then resets for the next token).
+        Only the mixer's SSM state carries across token boundaries.
+        """
         self.eval()
+        B        = idx.shape[0]
+        n_layers = len(self.blocks)
+
+        # SSM states persist across tokens; RLC/momentum reset per token
+        mixer_states = [None] * n_layers   # (alpha, beta) per layer
+
+        # ── Warm up SSM state on the prompt ──────────────────────────────────
+        for t in range(idx.shape[1]):
+            tok = idx[:, t]
+            pos = torch.tensor([t], device=idx.device)
+            x   = self.tok_emb(tok) + self.pos_emb(pos)   # [B, d_model]
+            rlc_state = None
+            momentum  = None
+            for i, block in enumerate(self.blocks):
+                mix_out, mixer_states[i] = block.mixer.step(
+                    block.ln_mix(x), mixer_states[i])
+                x = x + mix_out
+                filt_out, rlc_state, momentum = block.filter(
+                    block.ln_filt(x), rlc_state, momentum)
+                x = x + filt_out
+
+        # ── Generate new tokens ───────────────────────────────────────────────
+        cur_pos  = idx.shape[1] - 1
+        last_tok = idx[:, -1]
+
         for _ in range(max_new_tokens):
-            idx_c  = idx[:, -self.config.max_seq_len:]
-            logits, _ = self(idx_c)
-            logits = logits[:, -1, :] / temperature
+            cur_pos += 1
+            if cur_pos >= self.config.max_seq_len:
+                break
+            pos = torch.tensor([cur_pos], device=idx.device)
+            x   = self.tok_emb(last_tok) + self.pos_emb(pos)  # [B, d_model]
+            rlc_state = None
+            momentum  = None
+            for i, block in enumerate(self.blocks):
+                mix_out, mixer_states[i] = block.mixer.step(
+                    block.ln_mix(x), mixer_states[i])
+                x = x + mix_out
+                filt_out, rlc_state, momentum = block.filter(
+                    block.ln_filt(x), rlc_state, momentum)
+                x = x + filt_out
+
+            logits = self.lm_head(self.ln_f(x)) / temperature  # [B, vocab]
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, -1:]] = float("-inf")
-            idx = torch.cat([idx, torch.multinomial(F.softmax(logits, -1), 1)], 1)
+            next_tok = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
+            idx      = torch.cat([idx, next_tok.unsqueeze(-1)], dim=1)
+            last_tok = next_tok
+
         return idx
 
     # ── Diagnostics ──────────────────────────────────────────────────────────

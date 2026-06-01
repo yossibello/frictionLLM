@@ -265,6 +265,82 @@ class CoupledOscillatorMixer(nn.Module):
         y = self.norm(Y) * gate
         return self.proj_out(y)
 
+    # ── Recurrent step (O(1) per token at inference) ─────────────────────────
+
+    def step(
+        self,
+        x: torch.Tensor,
+        state: Optional[tuple] = None,
+    ) -> tuple:
+        """
+        Single-token recurrent forward — O(1) per token regardless of T.
+
+        Mathematically identical to the FFT forward but maintains explicit
+        SSM state instead of re-running the convolution over the full sequence.
+
+        The causal convolution  y[t] = Σ_{k≤t} h[t-k]·V[k]  equals:
+
+            alpha[t] = λ₁·alpha[t-1] + V[t]   where λ₁ = exp(s₁·dt)
+            beta[t]  = λ₂·beta[t-1]  + V[t]   where λ₂ = exp(s₂·dt)
+            y[t]     = (dt/L) · Re[(alpha−beta)/(s₁−s₂)]  mixed by pole_mix
+
+        This is the diagonal linear RNN / S4D recurrent form.
+
+        Args
+        ────
+        x     : [B, d_model]   single token embedding
+        state : (alpha, beta) each [B, d_inner, n_poles] complex64, or None
+
+        Returns
+        ───────
+        y         : [B, d_model]
+        new_state : (new_alpha, new_beta)
+        """
+        V    = self.proj_in(x)           # [B, d_inner]
+        gate = F.silu(self.proj_gate(x)) # [B, d_inner]
+
+        # Discrete-time poles — same derivation as _impulse_response
+        L  = self.L.float();  R  = self.R.float()
+        C  = self.C.float();  Lc = self.L_c.float()
+        dt = float(self.dt)
+
+        omega2 = (1.0 / C + 1.0 / Lc) / L
+        gamma  = R / (2.0 * L)
+        disc   = (gamma * gamma - omega2).to(torch.complex64)
+        sq     = torch.sqrt(disc)
+        g      = (-gamma).to(torch.complex64)
+        s1, s2 = g + sq, g - sq                     # [d_inner, n_poles]
+        lam1   = torch.exp(s1 * dt)
+        lam2   = torch.exp(s2 * dt)
+
+        B = x.shape[0]
+        if state is None:
+            shape = (B, self.d_inner, self.n_poles)
+            alpha = torch.zeros(shape, dtype=torch.complex64, device=x.device)
+            beta  = torch.zeros(shape, dtype=torch.complex64, device=x.device)
+        else:
+            alpha, beta = state
+
+        # V broadcast over poles: [B, d_inner, 1]
+        V_c = V.to(torch.complex64).unsqueeze(-1)
+
+        # State update
+        new_alpha = lam1.unsqueeze(0) * alpha + V_c  # [B, d_inner, n_poles]
+        new_beta  = lam2.unsqueeze(0) * beta  + V_c
+
+        # Output: (dt/L) · Re[(α−β)/(s₁−s₂)]
+        den      = (s1 - s2).unsqueeze(0)            # [1, d_inner, n_poles]
+        eps      = 1e-5
+        safe_den = torch.where(den.abs() < eps, den + eps, den)
+        Y_c      = (new_alpha - new_beta) / safe_den  # [B, d_inner, n_poles]
+        scale    = (dt / L).to(torch.complex64).unsqueeze(0)
+        Y_real   = (Y_c * scale).real                 # [B, d_inner, n_poles]
+
+        Y = (Y_real * self.pole_mix.unsqueeze(0)).sum(dim=-1)  # [B, d_inner]
+        Y = Y.to(V.dtype)
+        y = self.norm(Y) * gate
+        return self.proj_out(y), (new_alpha, new_beta)
+
     # ── Diagnostics ──────────────────────────────────────────────────────────
 
     @torch.no_grad()
