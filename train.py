@@ -121,7 +121,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str, device: torch.device) -> dict:
-    return torch.load(path, map_location=device)
+    return torch.load(path, map_location=device, weights_only=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

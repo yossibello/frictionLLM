@@ -84,7 +84,7 @@ def patch_for_sparse_cpu(model: FrictionLM) -> FrictionLM:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_model(checkpoint_path: str, device: torch.device) -> FrictionLM:
-    ckpt   = torch.load(checkpoint_path, map_location=device)
+    ckpt   = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ckpt["config"]
     model  = FrictionLM(config).to(device)
     model.load_state_dict(ckpt["model"])

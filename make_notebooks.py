@@ -464,7 +464,7 @@ ROBUST_EVAL_CELL = """\
 
 @torch.no_grad()
 def eval_checkpoint(ckpt_path, model_class, n_batches=200, batch_size=8):
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg  = ckpt["config"]
     m    = model_class(cfg).to(device)
     m.load_state_dict(ckpt["model"])
@@ -648,7 +648,7 @@ from friction_llm import PhysicsLM
 ckpts = sorted(glob.glob("/kaggle/working/checkpoints/physics/step_*.pt"))
 print("Available:", ckpts)
 
-ckpt  = torch.load(ckpts[-1], map_location=device)
+ckpt  = torch.load(ckpts[-1], map_location=device, weights_only=False)
 cfg   = ckpt["config"]
 physics_model = PhysicsLM(cfg).to(device)
 physics_model.load_state_dict(ckpt["model"])
