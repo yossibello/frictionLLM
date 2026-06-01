@@ -255,8 +255,9 @@ def train_rlc(model, train_ds, val_ds,
         "step": [], "loss": [], "val_loss": [], "sparsity": [],
         "omega_spread": [], "zeta_spread": [],
         "underdamped_layers": [], "sharpness": [],
-        "layers": [],   # full per-layer snapshot at each log step
+        "layers": [],
     }
+    best_val_loss = float("inf")
     lr_min = lr / 10
     t0     = time.time()
 
@@ -319,8 +320,22 @@ def train_rlc(model, train_ds, val_ds,
             history["sharpness"].append(sharpness)
             history["layers"].append(snap)
 
+            is_best = vloss.item() < best_val_loss
+            if is_best:
+                best_val_loss = vloss.item()
+                torch.save({
+                    "model":      base.state_dict(),
+                    "optimizer":  optimizer.state_dict(),
+                    "curriculum": curriculum.state_dict(),
+                    "step":       step,
+                    "val_loss":   best_val_loss,
+                    "history":    history,
+                    "config":     base.config,
+                }, os.path.join(ckpt_dir, "best.pt"))
+
             print(
                 f"step {step:5d} | loss {loss.item():.4f} | val {vloss.item():.4f} "
+                f"{'★' if is_best else ' '}"
                 f"| sparse {sparsity:.1%} | ω₀spread {omega_spread:.4f} "
                 f"| underdamped {underdamped}/{len(snap)} "
                 f"| sharp {sharpness:.1f} | {dt*1000:.0f}ms/step"
