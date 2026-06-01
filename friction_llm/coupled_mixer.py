@@ -265,41 +265,14 @@ class CoupledOscillatorMixer(nn.Module):
         y = self.norm(Y) * gate
         return self.proj_out(y)
 
-    # ── Recurrent step (O(1) per token at inference) ─────────────────────────
+    # ── Recurrent inference (O(1) per token) ──────────────────────────────────
 
-    def step(
-        self,
-        x: torch.Tensor,
-        state: Optional[tuple] = None,
-    ) -> tuple:
+    def gen_kernel(self) -> dict:
         """
-        Single-token recurrent forward — O(1) per token regardless of T.
-
-        Mathematically identical to the FFT forward but maintains explicit
-        SSM state instead of re-running the convolution over the full sequence.
-
-        The causal convolution  y[t] = Σ_{k≤t} h[t-k]·V[k]  equals:
-
-            alpha[t] = λ₁·alpha[t-1] + V[t]   where λ₁ = exp(s₁·dt)
-            beta[t]  = λ₂·beta[t-1]  + V[t]   where λ₂ = exp(s₂·dt)
-            y[t]     = (dt/L) · Re[(alpha−beta)/(s₁−s₂)]  mixed by pole_mix
-
-        This is the diagonal linear RNN / S4D recurrent form.
-
-        Args
-        ────
-        x     : [B, d_model]   single token embedding
-        state : (alpha, beta) each [B, d_inner, n_poles] complex64, or None
-
-        Returns
-        ───────
-        y         : [B, d_model]
-        new_state : (new_alpha, new_beta)
+        Precompute the recurrence constants ONCE per generation (not per token).
+        Returns λ₁, λ₂ (discrete poles), the safe (s₁−s₂) denominator, and the
+        (dt/L) output scale — all [d_inner, n_poles] complex64.
         """
-        V    = self.proj_in(x)           # [B, d_inner]
-        gate = F.silu(self.proj_gate(x)) # [B, d_inner]
-
-        # Discrete-time poles — same derivation as _impulse_response
         L  = self.L.float();  R  = self.R.float()
         C  = self.C.float();  Lc = self.L_c.float()
         dt = float(self.dt)
@@ -309,9 +282,55 @@ class CoupledOscillatorMixer(nn.Module):
         disc   = (gamma * gamma - omega2).to(torch.complex64)
         sq     = torch.sqrt(disc)
         g      = (-gamma).to(torch.complex64)
-        s1, s2 = g + sq, g - sq                     # [d_inner, n_poles]
-        lam1   = torch.exp(s1 * dt)
-        lam2   = torch.exp(s2 * dt)
+        s1, s2 = g + sq, g - sq
+
+        den      = s1 - s2
+        safe_den = torch.where(den.abs() < 1e-5, den + 1e-5, den)
+        return {
+            "lam1":  torch.exp(s1 * dt),
+            "lam2":  torch.exp(s2 * dt),
+            "den":   safe_den,
+            "scale": (dt / L).to(torch.complex64),
+            "dt":    dt,
+        }
+
+    def _emit(self, alpha, beta, gate, kernel):
+        """Read output y from SSM state: (dt/L)·Re[(α−β)/(s₁−s₂)] mixed by pole_mix."""
+        Y_c    = (alpha - beta) / kernel["den"].unsqueeze(0)
+        Y_real = (Y_c * kernel["scale"].unsqueeze(0)).real      # [B, d_inner, n_poles]
+        Y      = (Y_real * self.pole_mix.unsqueeze(0)).sum(dim=-1)  # [B, d_inner]
+        y      = self.norm(Y.to(gate.dtype)) * gate
+        return self.proj_out(y)
+
+    def step(self, x: torch.Tensor, state: Optional[tuple] = None,
+             kernel: Optional[dict] = None) -> tuple:
+        """
+        Single-token recurrent forward — O(1) per token regardless of context.
+
+        Mathematically identical to the FFT forward (diagonal linear-RNN / S4D
+        recurrent form):
+            alpha[t] = λ₁·alpha[t-1] + V[t]
+            beta[t]  = λ₂·beta[t-1]  + V[t]
+            y[t]     = (dt/L)·Re[(alpha−beta)/(s₁−s₂)]  mixed by pole_mix
+
+        Pass a `kernel` from gen_kernel() to avoid recomputing the poles each step.
+
+        Args
+        ────
+        x      : [B, d_model]   single token embedding
+        state  : (alpha, beta) each [B, d_inner, n_poles] complex64, or None
+        kernel : dict from gen_kernel(), or None to compute on the fly
+
+        Returns
+        ───────
+        y, (new_alpha, new_beta)
+        """
+        if kernel is None:
+            kernel = self.gen_kernel()
+
+        V    = self.proj_in(x)            # [B, d_inner]
+        gate = F.silu(self.proj_gate(x))  # [B, d_inner]
+        V_c  = V.to(torch.complex64).unsqueeze(-1)  # [B, d_inner, 1]
 
         B = x.shape[0]
         if state is None:
@@ -321,25 +340,37 @@ class CoupledOscillatorMixer(nn.Module):
         else:
             alpha, beta = state
 
-        # V broadcast over poles: [B, d_inner, 1]
-        V_c = V.to(torch.complex64).unsqueeze(-1)
+        new_alpha = kernel["lam1"].unsqueeze(0) * alpha + V_c
+        new_beta  = kernel["lam2"].unsqueeze(0) * beta  + V_c
+        return self._emit(new_alpha, new_beta, gate, kernel), (new_alpha, new_beta)
 
-        # State update
-        new_alpha = lam1.unsqueeze(0) * alpha + V_c  # [B, d_inner, n_poles]
-        new_beta  = lam2.unsqueeze(0) * beta  + V_c
+    def final_state(self, x: torch.Tensor, kernel: Optional[dict] = None) -> tuple:
+        """
+        Extract the SSM state (alpha, beta) at the LAST position of a sequence,
+        computed in parallel (no Python loop) so the prompt can be ingested fast.
 
-        # Output: (dt/L) · Re[(α−β)/(s₁−s₂)]
-        den      = (s1 - s2).unsqueeze(0)            # [1, d_inner, n_poles]
-        eps      = 1e-5
-        safe_den = torch.where(den.abs() < eps, den + eps, den)
-        Y_c      = (new_alpha - new_beta) / safe_den  # [B, d_inner, n_poles]
-        scale    = (dt / L).to(torch.complex64).unsqueeze(0)
-        Y_real   = (Y_c * scale).real                 # [B, d_inner, n_poles]
+            alpha[T-1] = Σ_{k=0}^{T-1} λ₁^(T-1-k)·V[k]
 
-        Y = (Y_real * self.pole_mix.unsqueeze(0)).sum(dim=-1)  # [B, d_inner]
-        Y = Y.to(V.dtype)
-        y = self.norm(Y) * gate
-        return self.proj_out(y), (new_alpha, new_beta)
+        Since |λ| < 1 (stable poles) the powers decay, no overflow.
+
+        Args
+        ────
+        x : [B, T, d_model]
+        Returns (alpha, beta) each [B, d_inner, n_poles] complex64.
+        """
+        if kernel is None:
+            kernel = self.gen_kernel()
+        B, T, _ = x.shape
+        V   = self.proj_in(x).to(torch.complex64)              # [B, T, d_inner]
+        exps = torch.arange(T - 1, -1, -1, device=x.device,
+                            dtype=torch.float32).to(torch.complex64)  # [T]
+        # λ^exp : [T, d_inner, n_poles]
+        pw1 = kernel["lam1"].unsqueeze(0) ** exps.view(T, 1, 1)
+        pw2 = kernel["lam2"].unsqueeze(0) ** exps.view(T, 1, 1)
+        Vc  = V.unsqueeze(-1)                                   # [B, T, d_inner, 1]
+        alpha = (Vc * pw1.unsqueeze(0)).sum(dim=1)             # [B, d_inner, n_poles]
+        beta  = (Vc * pw2.unsqueeze(0)).sum(dim=1)
+        return alpha, beta
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
 

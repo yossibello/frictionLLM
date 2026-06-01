@@ -117,54 +117,56 @@ class PhysicsLM(nn.Module):
         Only the mixer's SSM state carries across token boundaries.
         """
         self.eval()
-        B        = idx.shape[0]
         n_layers = len(self.blocks)
 
-        # SSM states persist across tokens; RLC/momentum reset per token
-        mixer_states = [None] * n_layers   # (alpha, beta) per layer
+        # Precompute each mixer's recurrence kernel ONCE (poles don't change)
+        kernels = [block.mixer.gen_kernel() for block in self.blocks]
 
-        # ── Warm up SSM state on the prompt ──────────────────────────────────
-        for t in range(idx.shape[1]):
-            tok = idx[:, t]
-            pos = torch.tensor([t], device=idx.device)
-            x   = self.tok_emb(tok) + self.pos_emb(pos)   # [B, d_model]
-            rlc_state = None
-            momentum  = None
-            for i, block in enumerate(self.blocks):
-                mix_out, mixer_states[i] = block.mixer.step(
-                    block.ln_mix(x), mixer_states[i])
-                x = x + mix_out
-                filt_out, rlc_state, momentum = block.filter(
-                    block.ln_filt(x), rlc_state, momentum)
-                x = x + filt_out
+        # ── Ingest the prompt in PARALLEL (FFT), extract SSM state at last pos ─
+        Tp  = idx.shape[1]
+        pos = torch.arange(Tp, device=idx.device)
+        x   = self.tok_emb(idx) + self.pos_emb(pos)        # [B, Tp, d_model]
 
-        # ── Generate new tokens ───────────────────────────────────────────────
-        cur_pos  = idx.shape[1] - 1
-        last_tok = idx[:, -1]
+        mixer_states = []
+        rlc_state = None
+        momentum  = None
+        for i, block in enumerate(self.blocks):
+            xin = block.ln_mix(x)
+            x   = x + block.mixer(xin)                     # parallel FFT conv
+            mixer_states.append(block.mixer.final_state(xin, kernels[i]))
+            # RLC/momentum are position-independent (integrate over depth, not
+            # sequence), so threading them block→block here matches training.
+            filt_out, rlc_state, momentum = block.filter(
+                block.ln_filt(x), rlc_state, momentum)
+            x = x + filt_out
 
+        logits = self.lm_head(self.ln_f(x))[:, -1, :]      # [B, vocab] last token
+
+        # ── Generate new tokens with O(1) recurrent steps ─────────────────────
+        cur_pos = Tp - 1
         for _ in range(max_new_tokens):
+            scaled = logits / temperature
+            if top_k is not None:
+                v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
+                scaled[scaled < v[:, -1:]] = float("-inf")
+            next_tok = torch.multinomial(F.softmax(scaled, dim=-1), 1).squeeze(-1)
+            idx      = torch.cat([idx, next_tok.unsqueeze(-1)], dim=1)
+
             cur_pos += 1
             if cur_pos >= self.config.max_seq_len:
                 break
             pos = torch.tensor([cur_pos], device=idx.device)
-            x   = self.tok_emb(last_tok) + self.pos_emb(pos)  # [B, d_model]
+            x   = self.tok_emb(next_tok) + self.pos_emb(pos)   # [B, d_model]
             rlc_state = None
             momentum  = None
             for i, block in enumerate(self.blocks):
                 mix_out, mixer_states[i] = block.mixer.step(
-                    block.ln_mix(x), mixer_states[i])
+                    block.ln_mix(x), mixer_states[i], kernels[i])
                 x = x + mix_out
                 filt_out, rlc_state, momentum = block.filter(
                     block.ln_filt(x), rlc_state, momentum)
                 x = x + filt_out
-
-            logits = self.lm_head(self.ln_f(x)) / temperature  # [B, vocab]
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, -1:]] = float("-inf")
-            next_tok = torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
-            idx      = torch.cat([idx, next_tok.unsqueeze(-1)], dim=1)
-            last_tok = next_tok
+            logits = self.lm_head(self.ln_f(x))                # [B, vocab]
 
         return idx
 
