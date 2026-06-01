@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
 
-from friction_llm import FrictionConfig, FrictionLM, RLCFrictionLM, SharpnessCurriculum
+from friction_llm import FrictionConfig, FrictionLM, RLCFrictionLM, PhysicsLM, SharpnessCurriculum
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,6 +190,11 @@ def train(args: argparse.Namespace) -> None:
         config.use_rlc = True
         model = RLCFrictionLM(config).to(device)
         print(f"Model: RLCFrictionLM — {model.param_count()/1e6:.1f} M parameters")
+    elif model_type == "physics":
+        config.use_rlc = True
+        config.use_coupled_mixer = True
+        model = PhysicsLM(config).to(device)
+        print(f"Model: PhysicsLM (no attention) — {model.param_count()/1e6:.1f} M parameters")
     else:
         model = FrictionLM(config).to(device)
         print(f"Model: FrictionLM — {model.param_count()/1e6:.1f} M parameters")
@@ -323,7 +328,7 @@ def main() -> None:
     p.add_argument("--lr_warmup",  type=int, default=500)
     p.add_argument("--use_amp",    action="store_true", default=True)
     p.add_argument("--compile",    action="store_true", default=False)
-    p.add_argument("--model",      default="friction",  choices=["friction", "rlc"],
+    p.add_argument("--model",      default="friction",  choices=["friction", "rlc", "physics"],
                    dest="model_type", help="friction=R only  |  rlc=full L+R+C circuit")
     args = p.parse_args()
 
