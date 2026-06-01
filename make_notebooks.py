@@ -156,28 +156,56 @@ del m_phy, m_base, cfg_test
 """
 
 DATA_CELL = """\
-import os
+import os, glob
 os.makedirs("data", exist_ok=True)
 
-try:
-    from datasets import load_dataset
-    print("Loading WikiText-103 (~103M tokens)...")
-    ds = load_dataset("wikitext", "wikitext-103-raw-v1")
-    with open("data/input.txt", "w", encoding="utf-8") as f:
-        for split in ["train", "validation", "test"]:
-            for row in ds[split]:
-                text = row["text"].strip()
-                if text:
-                    f.write(text + "\\n")
-    print(f"Saved: {os.path.getsize('data/input.txt')/1e6:.0f} MB")
-except Exception as e:
-    import urllib.request
-    print(f"Falling back to TinyShakespeare ({e})")
-    urllib.request.urlretrieve(
-        "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
-        "data/input.txt"
-    )
-    print(f"Downloaded: {os.path.getsize('data/input.txt')/1e6:.1f} MB")
+# ── Strategy 1: Kaggle built-in WikiText-103 (no internet needed) ────────────
+KAGGLE_WT103 = "/kaggle/input/wikitext-103-raw-v1"
+if os.path.isdir(KAGGLE_WT103):
+    files = sorted(glob.glob(os.path.join(KAGGLE_WT103, "*.tokens"))
+                   or glob.glob(os.path.join(KAGGLE_WT103, "wiki.*.raw"))
+                   or glob.glob(os.path.join(KAGGLE_WT103, "**/*"), recursive=True))
+    # Just concatenate every text file found under the dataset dir
+    text_files = [f for f in glob.glob(os.path.join(KAGGLE_WT103,"**"), recursive=True)
+                  if os.path.isfile(f)]
+    with open("data/input.txt", "w", encoding="utf-8") as out:
+        for tf in text_files:
+            try:
+                with open(tf, encoding="utf-8") as inp:
+                    for line in inp:
+                        l = line.strip()
+                        if l:
+                            out.write(l + "\\n")
+            except Exception:
+                pass
+    size = os.path.getsize("data/input.txt")
+    print(f"Kaggle dataset: {size/1e6:.0f} MB  ({size/1e9:.2f} GB)")
+
+# ── Strategy 2: HuggingFace datasets library (needs internet ON) ─────────────
+else:
+    try:
+        from datasets import load_dataset
+        print("Loading WikiText-103 from HuggingFace (~103M tokens)...")
+        print("(If this hangs: Settings → Internet → On  in the right-side panel)")
+        ds = load_dataset("wikitext", "wikitext-103-raw-v1")
+        with open("data/input.txt", "w", encoding="utf-8") as f:
+            for split in ["train", "validation", "test"]:
+                for row in ds[split]:
+                    text = row["text"].strip()
+                    if text:
+                        f.write(text + "\\n")
+        print(f"Saved: {os.path.getsize('data/input.txt')/1e6:.0f} MB")
+
+    # ── Strategy 3: TinyShakespeare fallback (internet ON, small dataset) ────
+    except Exception as e:
+        import urllib.request
+        print(f"WikiText failed ({e}), using TinyShakespeare fallback")
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
+            "data/input.txt"
+        )
+        print(f"Downloaded: {os.path.getsize('data/input.txt')/1e6:.1f} MB  "
+              f"(small — results will be weaker than WikiText-103)")
 """
 
 TOKENIZE_CELL = """\
