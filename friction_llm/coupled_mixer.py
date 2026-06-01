@@ -51,6 +51,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+@torch.jit.script
+def _impulse_loop(
+    beta_q:  torch.Tensor,
+    beta_i:  torch.Tensor,
+    alpha_q: torch.Tensor,
+    alpha_i: torch.Tensor,
+    delta:   torch.Tensor,
+    gamma:   torch.Tensor,
+    T: int,
+) -> torch.Tensor:
+    """
+    JIT-compiled impulse response loop — no Python overhead.
+    Computes h[t] = q-component of A^t @ B for t=0..T-1.
+    Runs entirely in C++, eliminates per-iteration Python→CUDA overhead.
+    """
+    d = delta.shape[0]
+    h = torch.zeros(T, d, dtype=delta.dtype, device=delta.device)
+    p_q = delta.clone()
+    p_i = gamma.clone()
+    h[0] = p_q
+    for t in range(1, T):
+        p_q_new = beta_q * p_q + beta_i * p_i
+        p_i     = alpha_q * p_q + alpha_i * p_i
+        p_q     = p_q_new
+        h[t]    = p_q
+    return h   # [T, d]
+
+
 class CoupledOscillatorMixer(nn.Module):
     """
     1D RLC transmission line along the token dimension.
@@ -127,35 +155,23 @@ class CoupledOscillatorMixer(nn.Module):
         """
         Compute h[t] = q-component of A^t @ B_input for t = 0..T-1.
 
-        The RLC system is linear time-invariant (A is constant across positions).
-        Its full output = causal convolution of V with this impulse response.
-
-        A = [[beta_q,  beta_i ],    B_input = [delta]    C = [1, 0]
-             [alpha_q, alpha_i]]              [gamma]
-
-        h[t] propagated via: p_q[t+1] = beta_q*p_q[t] + beta_i*p_i[t]
-                                         p_i[t+1] = alpha_q*p_q[t] + alpha_i*p_i[t]
-        This inner loop is over tiny [d] tensors — much faster than the full scan.
+        Uses a JIT-compiled loop over tiny [d] tensors (no Python overhead).
+        Always returns float32 — FFT requires float32, not float16.
         """
-        # ── Per-neuron state-transition coefficients ──────────────────────────
-        alpha_i = 1.0 - self.R * self.dt / self.L
-        alpha_q = self.dt * (-1.0 / (self.L * self.C) + 1.0 / (self.L * self.L_c))
-        gamma   = self.dt / self.L
-        beta_q  = 1.0 + alpha_q * self.dt
-        beta_i  = alpha_i * self.dt
-        delta   = gamma * self.dt
+        # Compute in float32 regardless of model dtype (FFT needs float32)
+        L  = self.L.float();  R  = self.R.float()
+        C  = self.C.float();  Lc = self.L_c.float()
+        dt = float(self.dt)
 
-        # ── Propagate A^t @ B_input ────────────────────────────────────────────
-        p_q = delta.clone()    # [d_inner]  — q-component of A^0 @ B
-        p_i = gamma.clone()    # [d_inner]  — i-component
+        alpha_i = 1.0 - R  * dt / L
+        alpha_q = dt * (-1.0 / (L * C) + 1.0 / (L * Lc))
+        gamma   = dt / L
+        beta_q  = 1.0 + alpha_q * dt
+        beta_i  = alpha_i * dt
+        delta   = gamma * dt
 
-        h = [p_q]
-        for _ in range(1, T):
-            p_q, p_i = (beta_q * p_q + beta_i * p_i,
-                        alpha_q * p_q + alpha_i * p_i)
-            h.append(p_q)
-
-        return torch.stack(h, dim=0)   # [T, d_inner]
+        return _impulse_loop(beta_q, beta_i, alpha_q, alpha_i,
+                             delta, gamma, T)   # [T, d_inner] float32
 
     # ── Forward (FFT parallel scan) ───────────────────────────────────────────
 
@@ -180,14 +196,16 @@ class CoupledOscillatorMixer(nn.Module):
         B, T, _ = x.shape
         V = self.proj_in(x)          # [B, T, d_inner]
 
-        h  = self._impulse_response(T)      # [T, d_inner]
+        h  = self._impulse_response(T)        # [T, d_inner]  float32
 
-        # ── Causal convolution via FFT ────────────────────────────────────────
-        n  = 2 * T                          # zero-pad to avoid circular wrap
-        H  = torch.fft.rfft(h,  n=n, dim=0)       # [n//2+1, d_inner]
-        U  = torch.fft.rfft(V,  n=n, dim=1)       # [B, n//2+1, d_inner]
-        Y  = torch.fft.irfft(H.unsqueeze(0) * U,
-                              n=n, dim=1)[:, :T]   # [B, T, d_inner]
+        # ── Causal convolution via FFT (always float32 — no ComplexHalf) ──────
+        n     = 2 * T
+        V_f32 = V.float()                          # cast input to float32
+        H     = torch.fft.rfft(h,     n=n, dim=0) # [n//2+1, d_inner]
+        U     = torch.fft.rfft(V_f32, n=n, dim=1) # [B, n//2+1, d_inner]
+        Y     = torch.fft.irfft(H.unsqueeze(0) * U,
+                                n=n, dim=1)[:, :T] # [B, T, d_inner]  float32
+        Y     = Y.to(V.dtype)                      # cast back (fp16 if AMP)
 
         y = self.norm(Y)
         return self.proj_out(y)
