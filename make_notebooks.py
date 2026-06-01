@@ -458,7 +458,7 @@ if history["layers"]:
     ax6.axvline(1.0, color="black", linestyle="--", linewidth=1.5, label="ζ=1 (critical)")
     ax6.set(xlabel="Damping ratio ζ", yticks=range(n_layers),
             yticklabels=[f"L{i}" for i in range(n_layers)],
-            title="Final ζ per Layer\n(red=resonant, blue=overdamped)")
+            title="Final zeta per Layer  (red=resonant, blue=overdamped)")
     ax6.legend(fontsize=8); ax6.grid(alpha=0.3, axis="x")
 
 plt.savefig("rlc_physics.png", dpi=150, bbox_inches="tight")
