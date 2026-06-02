@@ -50,6 +50,7 @@ class PhysicsBlock(nn.Module):
             L_c_init = config.mixer_L_c_init,
             clamp    = config.rlc_clamp,
             bias     = config.bias,
+            param_mode = config.mixer_param_mode,
         )
         self.ln_filt = nn.LayerNorm(config.d_model)
         self.filter  = RLCFrictionBlock(

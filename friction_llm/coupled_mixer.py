@@ -104,25 +104,37 @@ class CoupledOscillatorMixer(nn.Module):
         L_c_init: float = 5.0,
         clamp: float = 10.0,
         bias: bool = True,
+        param_mode: str = "rlc",
     ) -> None:
         super().__init__()
+        assert param_mode in ("rlc", "free"), param_mode
         d_inner = d_inner or d_model
-        self.d_inner = d_inner
-        self.n_poles = n_poles
-        self.dt      = dt
-        self.clamp   = clamp
+        self.d_inner    = d_inner
+        self.n_poles    = n_poles
+        self.dt         = dt
+        self.clamp      = clamp
+        self.param_mode = param_mode
 
-        # ── Per-channel, per-pole RLC (shape [d_inner, n_poles]) ──────────────
-        # Natural frequencies are spread logarithmically across the bank so the
-        # poles start diverse (identical poles would collapse the bank to one).
-        #   ω₀ = 1/√(LC); fix L=1 ⇒ C = 1/ω₀² ⇒ log_C = −2·log ω₀
+        # Diverse natural frequencies at init (shared by both modes)
         omega = torch.logspace(math.log10(0.5), math.log10(10.0), n_poles)  # [P]
-        log_C = (-2.0 * omega.log()).unsqueeze(0).repeat(d_inner, 1)        # [d,P]
 
-        self.log_L   = nn.Parameter(torch.zeros(d_inner, n_poles))
-        self.log_R   = nn.Parameter(torch.full((d_inner, n_poles), math.log(2.0)))
-        self.log_C   = nn.Parameter(log_C)
-        self.log_L_c = nn.Parameter(torch.full((d_inner, n_poles), math.log(L_c_init)))
+        if param_mode == "rlc":
+            # ── Physics parameterization: poles derived from L, R, C, L_c ──────
+            #   ω₀ = 1/√(LC); fix L=1 ⇒ C = 1/ω₀² ⇒ log_C = −2·log ω₀
+            log_C = (-2.0 * omega.log()).unsqueeze(0).repeat(d_inner, 1)    # [d,P]
+            self.log_L   = nn.Parameter(torch.zeros(d_inner, n_poles))
+            self.log_R   = nn.Parameter(torch.full((d_inner, n_poles), math.log(2.0)))
+            self.log_C   = nn.Parameter(log_C)
+            self.log_L_c = nn.Parameter(torch.full((d_inner, n_poles), math.log(L_c_init)))
+        else:
+            # ── Free S4D-style poles: s = −softplus(raw_gamma) ± i·omega_im ─────
+            # Same structure as RLC mode but poles are unconstrained learnables
+            # (this is the ablation baseline: "does the physics do work?").
+            # Init to match the RLC init: γ≈1, ω_d spread like the RLC kernel.
+            omega_d = (omega**2 + 0.2 - 1.0).clamp(min=0.04).sqrt()         # [P]
+            raw_gamma_init = math.log(math.expm1(1.0))                      # softplus⁻¹(1)
+            self.raw_gamma = nn.Parameter(torch.full((d_inner, n_poles), raw_gamma_init))
+            self.omega_im  = nn.Parameter(omega_d.unsqueeze(0).repeat(d_inner, 1))
 
         # ── Per-channel mixing weights over the pole bank ─────────────────────
         # Init 1/n_poles ⇒ kernel starts as the average of the bank (O(1) scale).
@@ -159,12 +171,46 @@ class CoupledOscillatorMixer(nn.Module):
         """Approximate wave speed along the chain: v = 1/√(L_c·C)"""
         return 1.0 / (self.L_c * self.C).sqrt()
 
+    # ── Poles (shared by FFT and recurrent paths) ─────────────────────────────
+
+    def _poles(self):
+        """
+        Continuous-time poles (s1, s2) and output scale, all [d_inner, n_poles]
+        complex64. The ONLY thing that differs between the RLC and free-pole
+        modes — everything downstream (kernel, recurrence, gating) is identical.
+
+          rlc  : s± = −γ ± √(γ²−ω²),  γ=R/2L,  ω²=(1/C+1/L_c)/L   (physics)
+          free : s± = −softplus(raw_γ) ± i·ω_im                   (S4D ablation)
+        """
+        if self.param_mode == "free":
+            gamma = F.softplus(self.raw_gamma).float()             # [d,P] >0
+            omega = self.omega_im.float()                          # [d,P]
+            g  = (-gamma).to(torch.complex64)
+            iw = (1j * omega).to(torch.complex64)
+            s1, s2 = g + iw, g - iw
+            scale  = torch.full_like(gamma, float(self.dt)).to(torch.complex64)
+        else:
+            L  = self.L.float();  R  = self.R.float()
+            C  = self.C.float();  Lc = self.L_c.float()
+            omega2 = (1.0 / C + 1.0 / Lc) / L                      # [d,P] >0
+            gamma  = R / (2.0 * L)                                  # [d,P] >0
+            disc   = (gamma * gamma - omega2).to(torch.complex64)
+            sq     = torch.sqrt(disc)
+            g      = (-gamma).to(torch.complex64)
+            s1, s2 = g + sq, g - sq
+            scale  = (float(self.dt) / L).to(torch.complex64)
+        return s1, s2, scale
+
     # ── Impulse response ─────────────────────────────────────────────────────
 
     def _impulse_response(self, T: int) -> torch.Tensor:
         """
-        Exact analytic impulse response of the damped RLC oscillator, sampled
-        at t = n·dt for n = 0..T-1.  Returns [T, d_inner] float32.
+        Exact analytic impulse response of the damped oscillator, sampled at
+        t = n·dt for n = 0..T-1.  Returns [T, d_inner] float32.
+
+        h(t) = scale·(e^{s₊t} − e^{s₋t})/(s₊ − s₋),  poles from _poles().
+        Unconditionally stable (Re[s] < 0 in both modes ⇒ e^{Re[s]·t} decays).
+        Always float32 — FFT requires it.
 
         Continuous-time per-channel ODE
         ────────────────────────────────
@@ -194,21 +240,13 @@ class CoupledOscillatorMixer(nn.Module):
         With a pole bank, L,R,C,L_c are [d, P]; the kernel is computed for every
         (channel, pole), then mixed down to one kernel per channel by `pole_mix`.
 
-        Always computed in float32 — FFT requires float32, not float16.
+        With a pole bank the kernel is computed per (channel, pole) then mixed
+        down to one kernel per channel by `pole_mix`.
         """
-        L  = self.L.float();  R  = self.R.float()
-        C  = self.C.float();  Lc = self.L_c.float()
+        s1, s2, scale = self._poles()                          # [d,P] complex
         dt = float(self.dt)
 
-        omega2 = (1.0 / C + 1.0 / Lc) / L          # [d,P]  effective stiffness > 0
-        gamma  = R / (2.0 * L)                      # [d,P]  decay rate > 0
-
-        disc = (gamma * gamma - omega2).to(torch.complex64)   # [d,P]
-        sq   = torch.sqrt(disc)                                # [d,P] complex
-        g    = (-gamma).to(torch.complex64)                    # [d,P]
-        s1, s2 = g + sq, g - sq                                # roots [d,P]
-
-        n = torch.arange(T, device=L.device, dtype=torch.float32)
+        n = torch.arange(T, device=s1.device, dtype=torch.float32)
         t = (n * dt).to(torch.complex64).view(T, 1, 1)         # [T,1,1]
 
         e1  = torch.exp(s1.unsqueeze(0) * t)                   # [T,d,P]
@@ -220,10 +258,10 @@ class CoupledOscillatorMixer(nn.Module):
         near  = den.abs() < eps
         h_gen = (e1 - e2) / torch.where(near, den + eps, den)
         h_crit = t * e1
-        h = torch.where(near, h_crit, h_gen).real                # [T,d,P]
+        h = torch.where(near, h_crit, h_gen)                     # [T,d,P] complex
 
-        h = h * (dt / L.unsqueeze(0))            # scale by (1/L)·dt (∼ discrete sum)
-        h = (h * self.pole_mix.unsqueeze(0)).sum(dim=-1)   # mix bank → [T, d_inner]
+        h = (h * scale.unsqueeze(0)).real                        # apply output scale
+        h = (h * self.pole_mix.unsqueeze(0)).sum(dim=-1)         # mix bank → [T, d_inner]
         return h.to(torch.float32)
 
     # ── Forward (FFT parallel scan) ───────────────────────────────────────────
@@ -271,26 +309,18 @@ class CoupledOscillatorMixer(nn.Module):
         """
         Precompute the recurrence constants ONCE per generation (not per token).
         Returns λ₁, λ₂ (discrete poles), the safe (s₁−s₂) denominator, and the
-        (dt/L) output scale — all [d_inner, n_poles] complex64.
+        output scale — all [d_inner, n_poles] complex64. Mode-agnostic (uses
+        the shared _poles()).
         """
-        L  = self.L.float();  R  = self.R.float()
-        C  = self.C.float();  Lc = self.L_c.float()
+        s1, s2, scale = self._poles()
         dt = float(self.dt)
-
-        omega2 = (1.0 / C + 1.0 / Lc) / L
-        gamma  = R / (2.0 * L)
-        disc   = (gamma * gamma - omega2).to(torch.complex64)
-        sq     = torch.sqrt(disc)
-        g      = (-gamma).to(torch.complex64)
-        s1, s2 = g + sq, g - sq
-
         den      = s1 - s2
         safe_den = torch.where(den.abs() < 1e-5, den + 1e-5, den)
         return {
             "lam1":  torch.exp(s1 * dt),
             "lam2":  torch.exp(s2 * dt),
             "den":   safe_den,
-            "scale": (dt / L).to(torch.complex64),
+            "scale": scale,
             "dt":    dt,
         }
 
@@ -376,22 +406,23 @@ class CoupledOscillatorMixer(nn.Module):
 
     @torch.no_grad()
     def wave_stats(self) -> dict:
-        # Spread of natural frequencies WITHIN the pole bank (per channel, then
-        # averaged) — the real diversity metric now that poles live per-channel.
-        omega_bank_spread = self.omega_0.std(dim=-1).mean().item() \
-            if self.n_poles > 1 else 0.0
+        # Derive frequency/damping from the actual poles so this works in both
+        # modes. s = −γ ± iω_d  ⇒  ω₀ = |s| = √(γ²+ω_d²),  ζ = γ/ω₀.
+        s1, _, _ = self._poles()
+        gamma = (-s1.real)                                   # [d,P] decay rate
+        omega_d = s1.imag.abs()                              # [d,P] damped freq
+        omega_0 = (gamma * gamma + omega_d * omega_d).sqrt() # natural freq
+        zeta    = gamma / omega_0.clamp(min=1e-6)
+        spread  = omega_0.std(dim=-1).mean().item() if self.n_poles > 1 else 0.0
         return {
-            "omega_0_mean":    self.omega_0.mean().item(),
-            "omega_0_spread":  omega_bank_spread,
-            "damping_mean":    self.damping_ratio.mean().item(),
-            "wave_speed_mean": self.wave_speed.mean().item(),
-            "coupling_mean":   (1.0 / self.L_c).mean().item(),
-            "underdamped_%":   (self.damping_ratio < 1.0).float().mean().item() * 100,
+            "omega_0_mean":    omega_0.mean().item(),
+            "omega_0_spread":  spread,
+            "damping_mean":    zeta.mean().item(),
+            "wave_speed_mean": 0.0,
+            "coupling_mean":   0.0,
+            "underdamped_%":   (zeta < 1.0).float().mean().item() * 100,
         }
 
     def extra_repr(self) -> str:
-        return (
-            f"d_inner={self.d_inner}, n_poles={self.n_poles}, dt={self.dt}, "
-            f"ω₀≈{self.omega_0.mean():.3f}, "
-            f"wave_speed≈{self.wave_speed.mean():.3f}"
-        )
+        return (f"d_inner={self.d_inner}, n_poles={self.n_poles}, "
+                f"dt={self.dt}, param_mode={self.param_mode}")

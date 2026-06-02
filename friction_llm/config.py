@@ -53,6 +53,7 @@ class FrictionConfig:
     mixer_L_c_init: float = 5.0        # coupling inductance between adjacent tokens
                                         # larger = weaker coupling at init
     mixer_n_poles: int = 8              # resonators per channel (S4D-style pole bank)
+    mixer_param_mode: str = "rlc"       # "rlc" = physics poles | "free" = S4D ablation
 
     # ── Friction Attention (Phase 2 — off by default) ─────────────────────────
     use_friction_attention: bool = False
